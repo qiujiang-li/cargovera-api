@@ -1,0 +1,25 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: cargovera-api
+  region: us-west-1
+  version: "1.29"
+
+vpc:
+  id: vpc-01787898655fffadb       #
+  subnets:
+    private:
+      us-west-1a:
+        id: subnet-0d00cf434bcc6a4eb 
+      us-west-1c:
+        id: subnet-0df0dbb6297c63f0b
+
+managedNodeGroups:
+  - name: cargovera-nodes
+    instanceType: t3.small
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 2
+    privateNetworking: true
+

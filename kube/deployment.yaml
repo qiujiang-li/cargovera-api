@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargovera-api
+  labels:
+    app: cargovera-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cargovera-api
+  template:
+    metadata:
+      labels:
+        app: cargovera-api
+    spec:
+      containers:
+        - name: cargovera-api
+          image: 193542828950.dkr.ecr.us-west-1.amazonaws.com/cargovera-api:0.1 
+          ports:
+            - containerPort: 80
+          envFrom:
+            - secretRef:
+                name: cargovera-api-secret
+          # optional: add readiness / liveness probes
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
