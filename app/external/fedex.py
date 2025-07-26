@@ -18,12 +18,25 @@ from app.core.exceptions import ExternalServiceException,ExternalServiceClientEr
 logger = logging.getLogger(__name__)
 
 class FedExService:
+    _signature_options_map = {
+        'carrier_default': 'SERVICE_DEFAULT',
+        'none': 'NO_SIGNATURE_REQUIRED',
+        'direct': 'DIRECT',
+        'indirect': 'INDIRECT',
+        'adult': 'ADULT',
+    }
     def __init__(self):
         self.base_url = os.getenv("FEDEX_BASE_URL")
         self.account_number = os.getenv("FEDEX_ACCOUNT_NUMBER")
         self.client_id = os.getenv("FEDEX_CLIENT_ID")
         self.client_secret = os.getenv("FEDEX_CLIENT_SECRET")
         self.default_contact_phone = os.getenv("DEFAULT_CONTACT_PHONE")
+    
+    def get_signature_option(self, signature_option: str) -> str:
+        try:
+            return self._signature_options_map[signature_option]
+        except KeyError:
+            raise ValueError(f"Unsupported FedEx signature option: '{signature_option}'")
 
     @async_cache(ttl=3500)
     async def _get_fedex_access_token(self) -> str:
@@ -178,13 +191,12 @@ class FedExService:
                         if response.status_code == 200:
                             return result.get("output", {}).get("rateReplyDetails", [])
                         elif 400 <= response.status_code < 500:
-                            raise ExternalServiceClientError(f"Failed to get rates from FedEx: {result}")
+                            raise ExternalServiceClientError(f"Failed to get rates from FedEx.")
                         else:
-                            raise ExternalServiceServerError(f"Failed to get rates from FedEx: {result}")
+                            raise ExternalServiceServerError(f"Failed to get rates from FedEx.")
             except  httpx.RequestError as e:
                 logger.exception(f"failed to get rates from FedEx {e}")
                 raise ExternalServiceException(f"Request failed: {str(e)}")
-                    
 
     async def get_quick_rates(self,
                         pickup_postal_code: str,
@@ -271,18 +283,19 @@ class FedExService:
                     headers={"Authorization": f"Bearer {token}"}
                 )
                 result = response.json()
-                logger.debug(f"response from buy label from fedex {result}")
+                logger.debug(f"FedEx buy label response: status={response.status_code}, body={result}")
                 if response.status_code == 200:
                     return result
                 elif 400 <= response.status_code < 500:
-                    raise ExternalServiceClientError(f"Failed to buy label from FedEx: {result}")
+                    raise ExternalServiceClientError(f"Failed to buy label from FedEx.")
                 else:
-                    raise ExternalServiceServerError(f"Failed to buy label from FedEx: {result}")
+                    raise ExternalServiceServerError(f"Failed to buy label from FedEx.")
         except httpx.RequestError as e:
-            logger.exception(f"failed to get rates from FedEx {e}")
+            logger.exception(f"Request to FedEx failed.")
             raise ExternalServiceException(f"Request failed: {str(e)}")
-
-
+        except Exception as e:
+            logger.exception(f"Unexpected error when buying label from FedEx.")
+            raise ExternalServiceException(f"Unexpected FedEx error: {str(e)}")
 
     @retry(
         retry=retry_if_exception_type((httpx.HTTPError, ExternalServiceServerError,httpx.ReadTimeout)),  # retry on HTTP exceptions
@@ -324,12 +337,16 @@ class FedExService:
                 if response.status_code == 200:
                     return result.get("output", {}).get("message","") == "Shipment is successfully cancelled"
                 elif 400 <= response.status_code < 500:
-                    raise ExternalServiceClientError(f"Failed to cancel label from FedEx: {result}")
+                    raise ExternalServiceClientError(f"Failed to cancel label from FedEx.")
                 else:
-                    raise ExternalServiceServerError(f"Failed to cancel label from FedEx: {result}")
+                    raise ExternalServiceServerError(f"Failed to cancel label from FedEx.")
         except  httpx.RequestError as e:
-                logger.exception(f"failed to cancel label from FedEx {e}")
-                raise ExternalServiceException(f"Request failed: {str(e)}")
+            logger.exception(f"failed to cancel label from FedEx.")
+            raise ExternalServiceException(f"Request failed: {str(e)}")
+        except Exception as e:
+            logger.exception(f"Unexpected excepion when cancel label from FedEx.")
+            raise ExternalServiceException(f"Unexpected FedEx error: {str(e)}")
+
 
 
     @retry(
@@ -377,10 +394,13 @@ class FedExService:
                             elif response.status_code == 400:
                                 return {"error": result.get("errors", [])[0].get("code", ""), "success": False}
                             else: 
-                                raise ExternalServiceServerError(f"Failed validate shipment with FedEx: {result}")
+                                raise ExternalServiceServerError(f"Failed validate shipment with FedEx.")
                 except httpx.HTTPError as e:
-                    logger.exception(f"failed to validate shipment {e}")
+                    logger.exception(f"failed to validate shipment.")
                     raise ExternalServiceException(f"Request failed: {str(e)}")
+                except Exception as e:
+                    logger.exception(f"Unexpected exceion when validate shipment.")
+                    raise ExternalServiceException(f"Unexcepted exception: {str(e)}")
 
 
     def _create_request_body(self,

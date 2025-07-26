@@ -15,7 +15,7 @@ router = APIRouter()
 def get_transaction_service():
     return TransactionService()
 
-@router.get("/")
+@router.get("")
 async def get_transactions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

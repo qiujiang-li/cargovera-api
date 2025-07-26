@@ -1,12 +1,11 @@
-from fastapi import APIRouter, Depends, status, Query, HTTPException
+from fastapi import APIRouter, Depends, status, Query, HTTPException, File, UploadFile
 from app.schemas.label import ShipmentRatesRequest, BuyLabelRequest, LabelSchema, CancelLabelRequest
-from app.external.fedex import FedExService
 from app.api.deps import get_current_user
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from functools import lru_cache
 from app.models.label import CarriersEnum, LabelStatus
-from uuid import uuid4
+from uuid import uuid4, UUID
 from app.models.label import Label
 from app.models.user import User
 from app.db.service import PaginationService
@@ -19,19 +18,15 @@ from decimal import Decimal
 from app.services.label import LabelService
 logger = logging.getLogger("labels")
 
+
 router = APIRouter()
 
 def get_label_service():
     return LabelService()
 
-@lru_cache()
-def get_fedex_service() -> FedExService:
-    """Create and cache FedEx API client instance."""
-    return FedExService()
-
-@router.post("/fedex/rates")
+@router.post("/rates")
 async def rate_shipment(data: ShipmentRatesRequest, label_service: LabelService = Depends(get_label_service),  user=Depends(get_current_user)):
-    sumarry_rates = await label_service.get_rates(CarriersEnum.fedex, data, user)
+    sumarry_rates = await label_service.get_rates(data, user)
     return {"data": sumarry_rates}
 
 @router.post("/fedex/buy-label",)
@@ -50,7 +45,7 @@ async def validate_shipment(data: BuyLabelRequest, label_service: LabelService =
 async def cancel_label(data: CancelLabelRequest, db: AsyncSession = Depends(get_db), user=Depends(get_current_user), label_service: LabelService = Depends(get_label_service)):
     return await label_service.cancel_label(CarriersEnum.fedex, data, user, db)
 
-@router.get("/")
+@router.get("")
 async def get_labels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -72,3 +67,21 @@ async def get_labels(
         user_id=user_id,
         db=db,
     )
+
+# @router.get("/{order_number}")
+# async def get_labels(order_number: str, db: AsyncSession = Depends(get_db), user=Depends(get_current_user),label_service: LabelService = Depends(get_label_service)):
+#     links = await label_service.get_labels_by_order(order_number, db, user)
+#     return {"data": links}
+
+@router.get("/{label_id}")
+async def get_labels(label_id: UUID, db: AsyncSession = Depends(get_db), user=Depends(get_current_user),label_service: LabelService = Depends(get_label_service)):
+    link = await label_service.get_labels_by_id(label_id, db, user)
+    return {"data": {"link": link}}
+
+@router.post("/upload-labels")
+async def upload_labels(
+    label_files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User =Depends(get_current_user),
+    label_service: LabelService = Depends(get_label_service)):
+    return await label_service.upload_labels(label_files,current_user.id, db)

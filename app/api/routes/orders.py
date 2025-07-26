@@ -21,7 +21,7 @@ router = APIRouter()
 def get_order_service():
     return OrderService()
 
-@router.get("/")
+@router.get("")
 async def get_orders(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

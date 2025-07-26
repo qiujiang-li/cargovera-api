@@ -23,15 +23,14 @@ class ShipmentRatesResponse(BaseModel):
     service_provider: str = Field(..., description="Name of the service provider")
     service_type: str = Field(..., description="Name of the service")
     total_charge: Decimal = Field(..., gt=0, description="Total charge in USD")
-    delivery_date: str = Field(..., description="Transit time in days")
-    delivery_dayofweek: str = Field(..., description="Delivery day of the week")
+    delivery_promise: str = Field(..., description="Transit time in days")
 
 class ShipmentRatesRequest(BaseModel):
     order_number: str
     service_type: Optional[str] = None
     shipper: AddressSchema
     recipient: AddressSchema
-    packages:  List[Dict[str, Any]]
+    packages: List[Dict[str, Any]] = Field(..., min_length=1)
 
 class CancelLabelRequest(BaseModel):
     tracking_number: str
@@ -47,6 +46,7 @@ class BuyLabelRequest(BaseModel):
     shipper: AddressSchema
     recipient: AddressSchema
     packages:  List[Dict[str, Any]]
+    signature_option: str
 
 
 class LabelSchema(BaseModel):
@@ -63,3 +63,18 @@ class LabelSchema(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+#USPS 
+class USPSLabelReqAddress(BaseModel):
+    firstName: str
+    lastName: str
+    streetAddress: str
+    secondaryAddress: str
+    city: str
+    state: str
+    ZIPCode: str
+
+class USPSLabelRequest(BaseModel):
+    toAddress: USPSLabelReqAddress
+    fromAddress: USPSLabelReqAddress

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Shipment Notification</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f6f8fa;
+      color: #333;
+      line-height: 1.6;
+      padding: 20px;
+    }
+    .container {
+      max-width: 650px;
+      margin: 0 auto;
+      background-color: #ffffff;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.05);
+    }
+    h2 {
+      color: #2c3e50;
+    }
+    a {
+      color: #1a73e8;
+      text-decoration: none;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 15px;
+    }
+    th, td {
+      border: 1px solid #eaeaea;
+      padding: 10px;
+      text-align: left;
+    }
+    th {
+      background-color: #f0f0f0;
+    }
+    .footer {
+      margin-top: 30px;
+      font-size: 0.9em;
+      color: #777;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Dear Admin,</h2>
+    <p><strong>{{ owner_name }}</strong> has sent you an outbound shipping label.</p>
+    <p>
+      Please <a href="https://www.cargovera.com/requests" target="_blank">log in to your Cargovera account</a> to process the shipment.
+    </p>
+
+    <p><strong>Shipment ID:</strong> {{ shipment_id }}</p>
+
+    <h3>Shipment Details</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Product Name</th>
+          <th>UPC</th>
+          <th>Quantity</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for product in products %}
+        <tr>
+          <td>{{ product.name }}</td>
+          <td>{{ product.upc }}</td>
+          <td>{{ product.quantity }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <p><strong>Notes:</strong> {{ notes or "—" }}</p>
+
+    <div class="footer">
+      <p>Cargovera – One-stop logistics solution for online retailers.</p>
+      <p><a href="http://www.cargovera.com" target="_blank">www.cargovera.com</a> | Support: <a href="mailto:cargovera.com@gmail.com">cargovera.com@gmail.com</a></p>
+    </div>
+  </div>
+</body>
+</html>

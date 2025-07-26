@@ -35,7 +35,7 @@ T = TypeVar('T')  # T can be any Pydantic model (e.g., ProductResponse, UserResp
 class PaginatedResponse(BaseModel,Generic[T]):
     data: List[T]
     pagination: PaginationInfo
-    links: PaginationLinks
+    links: Optional[PaginationLinks] = None
 
 class CursorData(BaseModel):
     id: UUID

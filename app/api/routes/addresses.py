@@ -16,7 +16,8 @@ logger = logging.getLogger("addresses")
 
 router = APIRouter()
 
-@router.get("/")
+@router.get("", include_in_schema=False)
+@router.get("/", include_in_schema=False)
 async def get_addresses(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -47,7 +48,7 @@ async def get_addresses(
         logger.exception(f"User {user_id} unexpected error getting addresses: {ex}")
         raise HTTPException(status_code=500, detail=f"Unexpected error while getting addresses")
 
-@router.post("/")
+@router.post("")
 async def create_address(address: AddressSchema, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     user_id = current_user.id
     try:

@@ -33,10 +33,22 @@ class UserMeSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UserSearchSchema(BaseModel):
+    id: UUID
+    email: str
+    name: str
+    phone: str
+    model_config = ConfigDict(from_attributes=True)
+
+
 
 class UpdateMultiplierRequest(BaseModel):
     multiplier: Decimal
     model_config = ConfigDict(from_attributes=True)
+
+class TopUpRequest(BaseModel):
+    amount: Decimal
+    model_config = ConfigDict(from_attributes=True)    
 
 
 class UpdateProfileSchema(BaseModel):

@@ -1,34 +1,36 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.schemas.user import UpdateProfileSchema, UserMeSchema
+from app.schemas.user import UpdateProfileSchema
 from uuid import UUID
 from app.db.session import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import UserNotFoundException
 from sqlalchemy import select
+from app.services.user import UserService
 router = APIRouter()
 
+def get_user_service():
+    return UserService()
 
-@router.put("/", )
+
+@router.put("", )
 async def update_profile(
     data: UpdateProfileSchema,
     current_user: User = Depends(get_current_user),
+    user_service = Depends(get_user_service),
     db: AsyncSession = Depends(get_db),
     ):
-        result = await db.execute(select(User).where(User.id == current_user.id))
-        user = result.scalar_one_or_none()
+    return await user_service.update_user(data, current_user.id, db)
 
-        if user is None:
-            raise UserNotFoundException(current_user.id)
-
-        if data.name: 
-            setattr(user, "name", data.name)
-        if data.phone:
-            setattr(user, "phone", data.phone)
-
-        await db.commit()
-        await db.refresh(user)
-        return UserMeSchema.from_orm(user)
+@router.get("")
+async def get_users(
+    q: str = Query(..., description="Search terms"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, le=100),
+    db: AsyncSession = Depends(get_db),
+    user_service = Depends(get_user_service),
+    current_user: User = Depends(get_current_user)):
+    return await user_service.search_users(db, q, page, limit)
 
 

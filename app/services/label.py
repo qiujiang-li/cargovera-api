@@ -1,5 +1,7 @@
 import logging
 from app.external.fedex import FedExService
+from fastapi import HTTPException, UploadFile, File
+from app.external.usps import USPSService
 from app.models.label import CarriersEnum, Label, LabelStatus
 from app.models.transaction import Transaction, TransactionType
 from app.schemas.label import BuyLabelRequest,ShipmentRatesRequest,ShipmentRatesResponse, LabelSchema
@@ -11,36 +13,54 @@ from typing import List, Optional
 from sqlalchemy import select
 from functools import lru_cache
 from app.core.exceptions import LabelValidationException, RateNotAvailableException, InsufficientBalanceException, DatabaseException, NegativeAmountException
-from uuid import uuid4
+from uuid import uuid4, UUID
 from decimal import Decimal, ROUND_HALF_UP
 from app.utils.money import Money
 from app.db.service import PaginationService
+from app.external.aws_s3 import generate_signed_url, download_and_upload_label, upload_file_to_s3
+import asyncio
+
 
 logger = logging.getLogger(__name__)
 
+MAX_FILE_SIZE_MB = 5
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_FILE_COUNT = 10
 
 @lru_cache()
 def get_fedex_service() -> FedExService:
     """Create and cache FedEx API client instance."""
     return FedExService()
 
+
+@lru_cache()
+def get_usps_service() -> FedExService:
+    """Create and cache FedEx API client instance."""
+    return USPSService()
+
 class LabelService:
     def __init__(self):
         pass
-    async def get_rates(self, carrier: CarriersEnum, data: ShipmentRatesRequest, user: User):
-        if carrier == CarriersEnum.fedex:
-            sumarry_rates = await self._get_fedex_rates(data)
-            #apply multiplier
-            results = [
-                ShipmentRatesResponse(
-                    **rate.model_dump(exclude={"total_charge"}),
-                    total_charge=self._apply_multiplier_to_rates(rate.total_charge, user.multiplier)
-                )
-                for rate in sumarry_rates
-            ]
-            return results
-        else:
-            raise UnSupportedCarrierException(carrier)
+
+    async def get_rates(self, data: ShipmentRatesRequest, user: User):
+        num_of_packages = len(data.packages)
+        if num_of_packages == 1:
+            fedex_rates, usps_rates = await asyncio.gather(
+                self._get_fedex_rates(data),
+                self._get_usps_rates(data)
+            )
+            summary_rates = fedex_rates + usps_rates
+        else: 
+            #USPS doesn't support multiple package in one request
+            summary_rates = await self._get_fedex_rates(data)
+
+        rates = [
+            ShipmentRatesResponse(
+                **rate.model_dump(exclude={"total_charge"}),
+                total_charge=self._apply_multiplier_to_rates(rate.total_charge, user.multiplier)
+            ) for rate in summary_rates]
+        results = sorted(rates, key=lambda x: x.total_charge)
+        return results
 
     async def buy_label(self, carrier: CarriersEnum, data: BuyLabelRequest, user: User, db: AsyncSession):
         if carrier == CarriersEnum.fedex:
@@ -105,7 +125,7 @@ class LabelService:
             filters=filters
         )
         except Exception as ex:
-            logger.exception(f"User {user_id} unexpected error getting labels: {ex}")
+            logger.exception(f"User {user_id} unexpected error getting labels")
             raise DatabaseException(500, f"Unexpected error while getting labels")
     
     
@@ -150,9 +170,11 @@ class LabelService:
             db.add(transaction)
             await db.commit()
             return
+        except DatabaseException as ex:
+            raise ex
         except Exception as ex:
             await db.rollback()
-            logger.exception(f"Failed to commit label cancel to DB: {ex}")
+            logger.exception(f"Failed to commit label cancel to DB")
             raise DatabaseException(500, "Failed to commit label cancel to DB")
 
     async def _get_fedex_rates(self, data: ShipmentRatesRequest):
@@ -168,27 +190,38 @@ class LabelService:
                             service_provider="FedEx",
                             service_type= rate.get("serviceType"), 
                             total_charge=rate["ratedShipmentDetails"][0]["totalNetFedExCharge"],
-                            delivery_date=rate.get("commit",{}).get("dateDetail",{}).get("dayFormat"),  
-                            delivery_dayofweek=rate.get("commit",{}).get("dateDetail",{}).get("dayOfWeek")) for rate in rates]
+                            delivery_promise=rate.get("commit",{}).get("dateDetail",{}).get("dayFormat")) for rate in rates] 
         return sumarry_rates
+
+
 
     
     async def _buy_fedex_label(self, data: BuyLabelRequest, user: User, db: AsyncSession):
         fedex = get_fedex_service()
-        res = await fedex.validate_shipment(shipper_address=data.shipper, 
-                                    recipient_address=data.recipient, 
-                                    serviceType=data.service_type, 
-                                    total_weight=data.total_weight, 
-                                    packages=data.packages, 
-                                    ship_date=data.ship_date, 
-                                    pickup_type=data.pickup_type or "DROPOFF_AT_FEDEX_LOCATION", 
-                                    labelStockType=data.label_stock_type or "PAPER_4X6", 
-                                    mergeLabelDocOption=data.merge_label_doc_option or "NONE")
+        
+        fedex_signature_option = fedex.get_signature_option(data.signature_option)
+        
+        packages = data.packages
+        updated_packages = [
+            {**pkg, "packageSpecialServices": {"signatureOptionType": fedex_signature_option}}
+            for pkg in packages
+        ]
+        data.packages = updated_packages
 
-        if not res:
-            raise LabelValidationException("not able to validate the shipment, please retry!")
-        if not res.get("success"):
-            raise LabelValidationException(res.get("error", "not able to validate the shipment, please retry!"))
+        # res = await fedex.validate_shipment(shipper_address=data.shipper, 
+        #                             recipient_address=data.recipient, 
+        #                             serviceType=data.service_type, 
+        #                             total_weight=data.total_weight, 
+        #                             packages=data.packages, 
+        #                             ship_date=data.ship_date, 
+        #                             pickup_type=data.pickup_type or "DROPOFF_AT_FEDEX_LOCATION", 
+        #                             labelStockType=data.label_stock_type or "PAPER_4X6", 
+        #                             mergeLabelDocOption=data.merge_label_doc_option or "NONE")
+
+        # if not res:
+        #     raise LabelValidationException("not able to validate the shipment, please retry!")
+        # if not res.get("success"):
+        #     raise LabelValidationException(res.get("error", "not able to validate the shipment, please retry!"))
 
         # get rates
         rates = await fedex.get_quick_rates(
@@ -222,13 +255,15 @@ class LabelService:
 
         label_details = result.get("output", {}).get("transactionShipments", [])[0].get("pieceResponses",[]);
         labels = [] 
-        for label_detail in label_details:  
+        for idx, label_detail in enumerate(label_details,start=1):
+            s3_key = download_and_upload_label(label_detail.get("packageDocuments",[])[0].get("url"), 
+                   data.order_number, idx, CarriersEnum.fedex.value)
             label = Label(
                 id=str(uuid4()),
                 user_id=user.id,
                 order_number=data.order_number,
                 tracking_number=label_detail.get("trackingNumber"),
-                label_url=label_detail.get("packageDocuments",[])[0].get("url"),
+                label_url=s3_key,
                 status=LabelStatus.new,
                 carrier=CarriersEnum.fedex,
                 service_type=data.service_type,
@@ -273,7 +308,7 @@ class LabelService:
             return labels
         except Exception as ex:
             await db.rollback()
-            logger.exception(f"failed to commit changes of buy label to db {ex}")
+            logger.exception(f"failed to commit changes of buy label to db")
             raise DatabaseException(500, "failed to commit changes of buy label to db")
 
     async def _validate_fedex_shipment(self, data:BuyLabelRequest):
@@ -298,5 +333,122 @@ class LabelService:
             raise NegativeAmountException(init_value)
 
         new_value = (init_value * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        logger.info(f"_apply_multiplier_to_rates init_value={init_value}, new_value={new_value}")
+        logger.debug(f"_apply_multiplier_to_rates init_value={init_value}, new_value={new_value}")
         return new_value
+
+
+    async def _get_usps_rates(self, data: ShipmentRatesRequest):
+        usps = get_usps_service()
+        rates_options = await usps.get_rates(
+                pickup_postal_code=data.shipper.postal_code,
+                destination_postal_code=data.recipient.postal_code, 
+                packages=data.packages)
+       
+        sumarry_rates = [ShipmentRatesResponse(
+                            service_provider="USPS",
+                            service_type= rates.get("mailClass"), 
+                            total_charge= rates.get("price"),
+                            delivery_promise=rates.get("productDefinition")) for rates in rates_options] 
+        return sumarry_rates
+    
+    async def get_labels_by_order(self, order_number: str, db: AsyncSession,  user: User):
+        try:
+            result = await db.execute(
+                    select(Label).where(Label.order_number == order_number)
+                )
+            labels = result.scalars().all()
+            if len(labels) == 0:
+                raise HTTPException(404, "Label not found")
+            links = [] 
+            for label in labels:
+                s3_key = label.label_url
+                signed_url = generate_signed_url(s3_key)
+                links.append(signed_url)
+            return links
+        except Exception as ex:
+            logger.exception(f"Failed to retrieve labels for order_number {order_number}")
+            raise DatabaseException(500, "Failed to commit label cancel to DB")
+
+    async def get_labels_by_id(self, label_id: UUID, db: AsyncSession,  user: User):
+        result = await db.execute(
+                select(Label).where(Label.id == label_id)
+            )
+        label = result.scalar_one_or_none()
+        if not label:
+            raise HTTPException(status_code=404, detail=f"label {label_id} not found")
+        s3_key = label.label_url
+        try:
+            signed_url = generate_signed_url(s3_key)
+            return signed_url
+        except Exception as ex:
+            logger.exception(f"Failed to retrieve label {label_id}")
+            raise DatabaseException(500, "Failed to retrieve label")
+    
+    async def upload_labels(self,
+        label_files: List[UploadFile],
+        user_id: str,
+        db: AsyncSession):
+
+        MAX_FILE_COUNT = 10
+        MAX_FILE_SIZE_MB = 5
+        MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+        ORDER_NUM_PLACEHOLDER = "0123456789"
+
+        if len(label_files) > MAX_FILE_COUNT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum of {MAX_FILE_COUNT} files allowed."
+            )
+
+        seen_filenames = set()
+        labels=[]
+        label_ids = []
+
+        for file in label_files:
+            if file.content_type != "application/pdf":
+                raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF.")
+
+            filename = file.filename.lower()
+            if filename in seen_filenames:
+                raise HTTPException(status_code=400, detail=f"Duplicate file: {file.filename}")
+            seen_filenames.add(filename)
+
+            file_data = await file.read()
+
+            if len(file_data) > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{file.filename} exceeds the {MAX_FILE_SIZE_MB}MB size limit."
+                )
+
+            s3_key = upload_file_to_s3(
+                file_data=file_data,
+                filename=file.filename,
+                content_type=file.content_type
+            )
+
+            label = Label(
+                id=uuid4(),
+                user_id=user_id,
+                order_number=ORDER_NUM_PLACEHOLDER,
+                tracking_number="n/a",
+                label_url = s3_key,
+                carrier = CarriersEnum.other,
+                status = LabelStatus.new,
+                service_type = "default",
+                cost_estimate_cents=0,
+                cost_actual_cents=0)
+            labels.append(label)
+            label_ids.append(label.id)
+        try:
+            if len(labels) > 0:
+                db.add_all(labels)
+                await db.commit()
+            return {"label_ids": label_ids}
+        except Exception as ex:
+            logger.exception(f"Failed to upload labels")
+            raise DatabaseException(500, "Failed to upload labels")
+        
+
+
+

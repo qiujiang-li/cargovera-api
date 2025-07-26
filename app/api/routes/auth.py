@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
-from app.schemas.auth import Token, LoginRequest, RegisterRequest,ForgotPasswordRequest, ResetPasswordRequest
+from app.schemas.auth import Token, LoginRequest, RegisterRequest,ForgotPasswordRequest, ResetPasswordRequest, AmazonOAuthCallbackRequest
 from app.core.security import create_access_token, hash_password
 from app.core.email_token import generate_reset_token, verify_reset_token, generate_email_token, verify_email_token
 from app.core.email import send_email
@@ -26,7 +26,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_email_verified:
         logger.warning(f"Email not verified for {request.email}")
         token = generate_email_token(user.email)
-        verification_link = f"{settings.app_name}/auth/verify?token={token}"
+        verification_link = f"{settings.api_host}/auth/verify?token={token}"
 
         send_email(
             to_email=user.email,
@@ -67,7 +67,7 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user.is_email_verified:
         logger.warning(f"Email not verified for {request.email}")
         token = generate_email_token(user.email)
-        verification_link = f"{settings.app_name}/auth/verify?token={token}"
+        verification_link = f"{settings.api_host}/auth/verify?token={token}"
 
         send_email(
             to_email=user.email,
@@ -110,7 +110,7 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
     db.add(user)
     await db.commit()
     token = generate_email_token(user.email)
-    verification_link = f"{settings.app_name}/auth/verify?token={token}"
+    verification_link = f"{settings.api_host}/auth/verify?token={token}"
 
     send_email(
         to_email=user.email,
@@ -163,26 +163,70 @@ async def forgot_password(request: ForgotPasswordRequest, db: AsyncSession = Dep
         reset_link = f"{settings.app_name}/reset-password?token={token}"
         # TODO: Implement send_email() for real
         logger.debug(f"[DEV MODE] Send this reset link to user: {reset_link}")
-        send_email(user.email, "[theshipbuddy] reset your password", reset_link)
+        send_email(user.email, "[Cargovera] reset your password", reset_link)
     return {"message": "If your email is registered, you will receive a reset link."}
 
 @router.post("/reset-password")
 async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
-    logger.info(f"Reset password request received for {payload.email}")
+    logger.info(f"Reset password request received")
     try:
         email = verify_reset_token(payload.token)
-        logger.info(f"Reset password request successful for {payload.email}")
+        logger.info(f"Reset password request successful for {email}")
     except Exception:
         logger.warning(f"Invalid or expired token")
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     user = await get_user_by_email(db, email)
     if not user:
-        logger.warning(f"User not found for {request.email}")
+        logger.warning(f"User not found for {email}")
         raise HTTPException(status_code=404, detail="User not found")
 
     user.password_hash = hash_password(payload.new_password)
     await db.commit()
-    logger.info(f"Reset password request successful for {payload.email}")
+    logger.info(f"Reset password request successful for {email}")
     return {"message": "Password has been reset successfully."}
+
+
+@router.post("/amazon/callback")
+async def handle_amazon_callback(payload: AmazonOAuthCallbackRequest,  db: AsyncSession = Depends(get_db)):
+    """
+    Handle OAuth callback: exchange code for refresh_token and save to DB.
+    """
+    # Exchange code for refresh_token
+    data = {
+        "grant_type": "authorization_code",
+        "code": payload.code,
+        "client_id": config.AMAZON_CLIENT_ID,
+        "client_secret": config.AMAZON_CLIENT_SECRET,
+        "redirect_uri": config.AMAZON_REDIRECT_URI
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(config.AMAZON_TOKEN_URL, data=data)
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to exchange code: {response.text}"
+        )
+
+    token_data = response.json()
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="Missing refresh_token in response")
+
+    # Save to DB
+    new_store = models.Webstore(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),   # replace with: current_user.id
+        store_type="amazon",
+        store_unique_id=payload.selling_partner_id,
+        refresh_token=refresh_token,
+        connection_status="connected"
+    )
+
+    db.add(new_store)
+    await db.commit()
+
+    return {"success": True}
 

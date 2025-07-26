@@ -24,3 +24,9 @@ class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(..., min_length=6)
 
+
+class AmazonOAuthCallbackRequest(BaseModel):
+    code: str
+    selling_partner_id: str
+
+

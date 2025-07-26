@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: cargovera-api
-          image: 193542828950.dkr.ecr.us-west-1.amazonaws.com/cargovera-api:0.1 
+          image: 193542828950.dkr.ecr.us-west-1.amazonaws.com/cargovera-api:1.9 
           ports:
             - containerPort: 80
           envFrom:

@@ -11,3 +11,8 @@ passlib[bcrypt]==1.7.4
 httpx
 tenacity
 stripe
+cryptography
+boto3
+jinja2
+aiosmtplib
+python-multipart

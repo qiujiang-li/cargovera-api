@@ -2,19 +2,24 @@
 
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import selectinload
+from sqlalchemy.inspection import inspect
 from app.schemas.pagination import PaginatedResponse, SortOrder, PaginationLinks, PaginationInfo
 from app.schemas.pagination import CursorData
+from sqlalchemy.orm import aliased
 from fastapi import HTTPException
 import json
 import base64
 from datetime import datetime
-from sqlalchemy import or_, and_, desc, asc, select, func
-from typing import Dict, Any, List, TypeVar, Type
+from sqlalchemy import or_, and_, desc, asc, select, func,cast, String
+from typing import Dict, Any, List, TypeVar, Type, Tuple
 from pydantic import BaseModel
+from app.models.inventory import Inventory
+import logging
 
 # Generic type for the output schema classes
 T = TypeVar('T', bound=BaseModel)
-
+logger = logging.getLogger(__name__)
 # Utility functions
 def encode_cursor(cursor_data: CursorData) -> str:
     """Encode cursor data to base64 string"""
@@ -45,6 +50,320 @@ def decode_cursor(cursor: str) -> CursorData:
 class PaginationService:
     def __init__(self, db: Session):
         self.db = db
+
+    async def paginate_like(
+    self,
+    model_class,
+    output_schema: Type[T],
+    column_name: str,
+    query_str: str,
+    page: int,
+    limit: int = 10
+
+    ) -> PaginatedResponse:
+
+        # Count total items
+        column = getattr(model_class, column_name)
+        condition = or_(
+            func.lower(column).ilike(f"%{query_str}%"),
+            func.similarity(func.lower(column), query_str) > 0.03
+        )
+        count_stmt = select(func.count()).select_from(
+            select(model_class)
+            .where(condition)
+            .subquery()
+        )
+        count_result = await self.db.execute(count_stmt)
+        total_items = count_result.scalar_one()
+        print(total_items)
+
+        total_pages = (total_items + limit - 1) // limit
+        # Validate page number
+        if page is None or page < 1:
+            page = 1
+        elif page > total_pages and total_pages > 0:
+            raise HTTPException(status_code=404, detail="Page not found")
+
+        # Apply offset and limit
+        offset = (page - 1) * limit
+
+        # Primary: pg_trgm similarity
+        stmt = (
+            select(model_class)
+            .where(condition)
+            .order_by(func.similarity(column, query_str).desc())
+            .offset(offset)
+            .limit(limit)
+        )
+
+        result = await self.db.execute(stmt)
+        items = result.scalars().all()
+
+        pagination = PaginationInfo(
+            current_page=page,
+            total_pages=total_pages,
+            total_items=total_items,
+            items_per_page=limit,
+            has_next=page < total_pages,
+            has_previous=page > 1
+        )
+        
+        #links = self._build_offset_links(page, total_pages, limit, sort_by, sort_order)
+        
+        return PaginatedResponse(data=items, pagination=pagination, links=None)
+        
+    def _get_column(self,model_class, field_path: str):
+        """Supports dot-paths like 'product.name'."""
+        parts = field_path.split('.')
+        current = model_class
+        for i, part in enumerate(parts):
+            try:
+                current = getattr(current, part)
+            except AttributeError:
+                raise ValueError(f"Invalid field path: {field_path}")
+            
+            if i == len(parts) - 1:
+                return current
+
+            # Dive into related model if it's a relationship
+            if hasattr(current, "property") and hasattr(current.property, "mapper"):
+                current = current.property.mapper.class_
+            else:
+                raise ValueError(f"Cannot resolve relationship for: {'.'.join(parts[:i+1])}")
+
+        return current
+
+    def _build_eager_loads(self, model: Any, paths: List[str]):
+        loaders = []
+        seen_paths = set()
+
+        for path in paths:
+            if path in seen_paths:
+                continue  # Avoid duplicate loaders
+            seen_paths.add(path)
+
+            attrs = path.split(".")
+            loader = None
+            current_model = model
+
+            for i, attr in enumerate(attrs):
+                try:
+                    attr_class_attr = getattr(current_model, attr)
+                except AttributeError:
+                    raise ValueError(f"Invalid eager load path '{path}': '{attr}' not found on {current_model.__name__}")
+                if i == 0:
+                    loader = selectinload(attr_class_attr)
+                else:
+                    loader = loader.selectinload(attr_class_attr)
+                # Navigate into the relationship’s model for the next attr
+                rel = attr_class_attr.property
+                current_model = rel.mapper.class_
+            loaders.append(loader)
+        return loaders
+    
+    def _apply_joins(self, stmt, model_class, column_paths):
+        joined_paths = {}         # e.g. "inventory.owner" -> aliased model or real model
+        table_name_counts = {}    # to track multiple joins to the same table
+
+        for path in column_paths:
+            parts = path.split(".")
+            if len(parts) < 2:
+                continue
+
+            current_model = model_class
+            join_path = []
+
+            for i in range(len(parts) - 1):  # skip final column (not a relationship)
+                rel_name = parts[i]
+                join_path.append(rel_name)
+                path_key = ".".join(join_path)
+
+                # If already joined, use the cached model
+                if path_key in joined_paths:
+                    current_model = joined_paths[path_key]
+                    continue
+
+                attr = getattr(current_model, rel_name)
+                rel_model = attr.property.mapper.class_
+                table_name = rel_model.__tablename__
+
+                # Count how many times this table has been joined
+                table_name_counts[table_name] = table_name_counts.get(table_name, 0) + 1
+
+                if table_name_counts[table_name] > 1:
+                    # Alias required to prevent duplicate join to same table
+                    aliased_model = aliased(rel_model)
+                    aliased_attr = attr.of_type(aliased_model)
+                    stmt = stmt.join(aliased_attr)
+                    current_model = aliased_model
+                else:
+                    # Standard join without aliasing
+                    stmt = stmt.join(attr)
+                    current_model = rel_model
+
+                # Store the model (aliased or not) used for this join path
+                joined_paths[path_key] = current_model
+
+        return stmt, joined_paths
+
+    def _resolve_attr_path(self, model_class, path: str, joined_paths: Dict[str, Any]):
+        if not isinstance(path, str):
+            raise TypeError(f"path must be str, got {type(path)}")
+
+        parts = path.split(".")
+        current_model = model_class
+        attr = None
+        current_path = []
+
+        for i, part in enumerate(parts):
+            current_path.append(part)
+            path_key = ".".join(current_path)
+
+            # Use joined_paths to get the correct model if already joined
+            if path_key in joined_paths:
+                current_model = joined_paths[path_key]
+                attr = current_model  # alias or mapped class
+                continue
+
+            try:
+                attr = getattr(current_model, part)
+            except AttributeError:
+                raise AttributeError(f"{current_model} has no attribute '{part}' (while resolving '{path}')")
+
+            # If this is a relationship, move to the related model
+            if hasattr(attr, "property") and hasattr(attr.property, "mapper"):
+                current_model = attr.property.mapper.class_
+        return attr
+
+    def _build_search_condition(self, model_class, search_columns, query_str, joined_paths: Dict[str, Any],language="english"):
+        if not query_str or not search_columns:
+            return None
+
+        # Resolve columns with nested support
+        columns = [self._resolve_attr_path(model_class, col, joined_paths) for col in search_columns]
+
+        # Build tsvector
+        tsvector = func.to_tsvector(
+            language,
+            func.concat_ws(' ', *[cast(col, String) for col in columns])
+        )
+
+        tsquery = func.websearch_to_tsquery(language, query_str)
+
+        # Full-text condition
+        fulltext_condition = tsvector.op('@@')(tsquery)
+
+        # Similarity conditions (fallback fuzzy matching)
+        similarity_conditions = [
+            func.similarity(func.lower(cast(col, String)), query_str.lower()) > 0.03
+            for col in columns
+        ]
+        return or_(fulltext_condition, *similarity_conditions)
+
+    async def paginate_with_full_search(
+        self, 
+        model_class,
+        output_schema: Type[T],
+        query_str: str,
+        search_columns: List[str],
+        page: int,
+        limit: int,
+        sort_by: str, 
+        sort_order: SortOrder,
+        rank: bool = True,
+        eager_load: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        language: str = "english"): 
+        offset = (page - 1) * limit
+
+        stmt = select(model_class)
+
+        #if join needed
+        # Apply joins for search and nested filters
+        all_paths = (search_columns or []) + list(filters.keys() if filters else [])
+        stmt, joined_paths = self._apply_joins(stmt, model_class, all_paths)
+        # Apply filters
+        logger.info(f"Filters type: {type(filters)}")
+        logger.info(f"Filters content: {filters}")
+        if filters:
+            for path, value in filters.items():
+                # Pass the path string and the joined_paths dict separately
+                attr = self._resolve_attr_path(model_class, path, joined_paths)
+                stmt = stmt.where(attr == value)
+        conditions = []
+
+        if query_str:
+            search_condition = self._build_search_condition(
+            model_class=model_class,
+            search_columns=search_columns,
+            query_str=query_str,
+            joined_paths=joined_paths,
+            language=language)
+            conditions.append(search_condition)
+
+        # Eager load relationships
+        load_options = self._build_eager_loads(model_class, eager_load)
+        if load_options:
+            stmt = stmt.options(*load_options)
+
+
+        # if filters:
+        #     for field, value in filters.items():
+        #         if hasattr(model_class, field) and value is not None:
+        #             column = getattr(model_class, field)
+        #             if isinstance(value, dict):
+        #                 # Handle range filters like {"gte": 100, "lte": 500}
+        #                 if "gte" in value:
+        #                     conditions.append(column >= value['gte'])
+        #                 if "lte" in value:
+        #                     conditions.append(column <= value['lte'])
+        #                 if "eq" in value:
+        #                     conditions.append(column == value['eq'])
+        #                 if "like" in value:
+        #                     conditions.append(column.ilike(f"%{value['like']}%"))
+
+        #             else:
+        #                 # Direct equality filter
+        #                 conditions.append(column == value)
+        
+        stmt = stmt.where(and_(*conditions))
+
+        # Apply sorting
+        sort_column = getattr(model_class, sort_by, getattr(model_class, "created_at", getattr(model_class, "id")))
+        if sort_order == SortOrder.desc:
+            stmt = stmt.order_by(desc(sort_column))
+        else:
+            stmt = stmt.order_by(asc(sort_column))
+
+        # if rank:
+        #     rank_expr = func.ts_rank(tsvector, tsquery)
+        #     stmt = stmt.order_by(rank_expr.desc())
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_result = await self.db.execute(count_stmt)
+        total_items = count_result.scalar_one()
+
+        
+        stmt = stmt.offset(offset).limit(limit)
+        result = await self.db.execute(stmt)
+        items = result.scalars().all()
+
+        total_pages = (total_items + limit - 1) // limit
+        
+        pagination = PaginationInfo(
+                current_page=page,
+                total_pages=total_pages,
+                total_items=total_items,
+                items_per_page=limit,
+                has_next=page < total_pages,
+                has_previous=page > 1
+            )
+        
+            #links = self._build_offset_links(page, total_pages, limit, sort_by, sort_order)
+          # Build response (generic - works with any model)
+        data = [output_schema.from_orm(item) for item in items] 
+        return PaginatedResponse(data=data, pagination=pagination, links=None)
+
+
     
     async def paginate(
         self,
@@ -173,9 +492,9 @@ class PaginationService:
                 previous_cursor=previous_cursor
             )
             
-            links = self._build_offset_links(page, total_pages, limit, sort_by, sort_order)
+            #links = self._build_offset_links(page, total_pages, limit, sort_by, sort_order)
             
-            return PaginatedResponse(data=data, pagination=pagination, links=links)
+            return PaginatedResponse(data=data, pagination=pagination, links=None)
 
     def _cursor_paginate(
             self, 

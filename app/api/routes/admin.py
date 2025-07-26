@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from uuid import uuid4, UUID
 from app.models.user import User
-from app.schemas.user import UserSchema, UpdateMultiplierRequest
+from app.schemas.user import UserSchema, UpdateMultiplierRequest, TopUpRequest
 from app.services.admin import AdminService
 from app.schemas.pagination import SortOrder
 from typing import List, Optional
@@ -56,7 +56,17 @@ async def activate_user(
 async def update_multiplier(user_id: UUID, data: UpdateMultiplierRequest, 
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
-    admin_service: LabelService = Depends(get_admin_service)):
+    admin_service: AdminService = Depends(get_admin_service)):
 
     multiplier = data.multiplier
     return await admin_service.update_multiplier(user_id, multiplier, db)
+
+
+@router.post("/{user_id}/topup")
+async def update_balance(user_id: UUID, data: TopUpRequest,
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+    admin_service: AdminService = Depends(get_admin_service)):
+    logger.info(f"request topup for user {user_id}, amount {data.amount}")
+
+    return await admin_service.update_balance(user_id, data.amount, db)

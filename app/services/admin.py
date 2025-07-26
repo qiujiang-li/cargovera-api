@@ -20,7 +20,7 @@ from decimal import Decimal
 from app.utils.money import Money
 from app.db.service import PaginationService
 
-
+logger = logging.getLogger(__name__)
 
 class AdminService:
     def __init__(self):
@@ -89,5 +89,34 @@ class AdminService:
         except Exception as ex:
             logger.exception(f"failed to update user {user_id} with new multiplier: {ex}")
             raise DatabaseException(500, f"failed to update the multiplier")
+
+
+    async def update_balance(self, user_id:str, amount: Decimal, db: AsyncSession):
+ 
+        try:
+            # Step 1: lock the user row to safely update balance
+            result = await db.execute(
+                select(User).where(User.id == user_id).with_for_update()
+            )
+            user_locked = result.scalar_one()
+                        # Step 4: create transaction and update balance
+            user_locked.balance += amount
+
+            transaction = Transaction(
+                id=str(uuid4()),
+                user_id=user_locked.id,
+                amount=amount,
+                new_balance=user_locked.balance,
+                trans_type=TransactionType.adjustment,
+                note=f"adjusted balance by admin"
+            )
+
+            db.add(transaction)
+            await db.commit()
+        except Exception as ex:
+            await db.rollback()
+            logger.exception(f"Failed to update balance change DB: {ex}")
+            raise DatabaseException(500, "Failed to update balance.")
+
 
 

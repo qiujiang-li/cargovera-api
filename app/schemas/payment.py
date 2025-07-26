@@ -4,7 +4,7 @@ from typing import List
 from decimal import Decimal
 
 class PaymentRequest(BaseModel):
-    amount: Decimal = Field(gt=25, lt=1000)
+    amount: Decimal = Field(ge=25, lt=1000)
     currency: str = Field(default="usd", pattern="^[a-z]{3}$")
 
 class PaymentResponse(BaseModel):
