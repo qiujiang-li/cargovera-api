@@ -8,6 +8,8 @@ from datetime import datetime
 from pydantic import ConfigDict
 
 
+class ConfirmFulfillRequest(BaseModel):
+    note: str
 
 class FulfillmentItemCreate(BaseModel):
     inventory_id: UUID4

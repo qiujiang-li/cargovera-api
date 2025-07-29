@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, status, Query, HTTPException, BackgroundTasks
-from app.schemas.fulfillment import FulfillmentRequestCreate
+from app.schemas.fulfillment import FulfillmentRequestCreate, ConfirmFulfillRequest
 from app.models.fulfillment import FulfillmentRequeestStatusEnum
 from app.api.deps import get_current_user
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,7 @@ from decimal import Decimal
 from app.services.fulfillment import FulfillmentService
 from app.schemas.pagination import PaginatedResponse, PaginationInfo
 from app.schemas.inventory import AddInventoryRequest
-import datetime
+from datetime import datetime
 
 logger = logging.getLogger("__main__")
 
@@ -46,13 +46,13 @@ async def get_fulfillment_requests(
     status: Optional[FulfillmentRequeestStatusEnum] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(10, le=100),
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
     db: AsyncSession = Depends(get_db),
     fulfillment_service: FulfillmentService = Depends(get_fulfillment_service),
     current_user: User = Depends(get_current_user)):
     as_owner = True
-    return await fulfillment_service.get_fulfillment_requests(as_owner, status,date_from, date_to, page, limit, db, current_user)
+    return await fulfillment_service.get_fulfillment_requests(as_owner, status, date_from, date_to, page, limit, db, current_user)
 
 
 @router.get("/requests/holder")
@@ -60,19 +60,20 @@ async def get_fulfillment_requests(
     status: Optional[FulfillmentRequeestStatusEnum] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(10, le=100),
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
     db: AsyncSession = Depends(get_db),
     fulfillment_service: FulfillmentService = Depends(get_fulfillment_service),
     current_user: User = Depends(get_current_user)):
     as_owner = False
-    return await fulfillment_service.get_fulfillment_requests(as_owner, status,date_from, date_to, page, limit, db, current_user)
+    return await fulfillment_service.get_fulfillment_requests(as_owner, status, date_from, date_to, page, limit, db, current_user)
 
 @router.post("/requests/{request_id}")
 async def fulfill_request(
     request_id: UUID,
+    data: ConfirmFulfillRequest,
     db: AsyncSession = Depends(get_db),
     fulfillment_service: FulfillmentService = Depends(get_fulfillment_service),
     current_user: User = Depends(get_current_user)):
-    return await fulfillment_service.fulfill_request(request_id, current_user.id, db)
+    return await fulfillment_service.fulfill_request(request_id, data.note, current_user.id, db)
 

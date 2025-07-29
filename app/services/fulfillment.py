@@ -205,7 +205,6 @@ class FulfillmentService:
                 filters.append(FulfillmentRequest.status == status)
             else:
                 filters.append(FulfillmentRequest.status == FulfillmentRequeestStatusEnum.pending)
-
             # Filter by created_at range
             if created_from:
                 filters.append(FulfillmentRequest.created_at >= created_from)
@@ -243,7 +242,7 @@ class FulfillmentService:
                 links=None,
             )
 
-    async def fulfill_request(self, request_id: uuid.UUID, user_id: str, db: AsyncSession):
+    async def fulfill_request(self, request_id: uuid.UUID, note: str, user_id: str, db: AsyncSession):
         # Step 1: Load FulfillmentRequest with items (locked for update)
         result = await db.execute(
             select(FulfillmentRequest)
@@ -297,7 +296,7 @@ class FulfillmentService:
                 quantity=item.quantity,
                 source=InventoryTransactionSourceEnum.outbound,
                 source_ref_id=str(request_id),
-                note="Fulfilled request"
+                note=note
             ))
 
             # Step 3: Update related Label entities' status to 'shipped'

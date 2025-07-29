@@ -57,6 +57,7 @@ class InventoryService:
             if existing_inventory:
                 # Increment available_qty
                 existing_inventory.available_qty += data.available_qty
+                existing_inventory.status=InventoryStatusEnum.active
 
                 inventry_transaction = InventoryTransaction(
                     inventory_id=existing_inventory.id,

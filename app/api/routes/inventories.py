@@ -72,7 +72,7 @@ async def get_an_inventory_transactions(
 
 @router.get("/transactions/owner")
 async def get_inventory_transactions(
-    inventory_id: Optional[str] =  Query(None, description="Inventory Id"),
+    inventory_id: Optional[UUID] =  Query(None, description="Inventory Id"),
     q: str = Query(..., description="Search term"),
     page: Optional[int] = Query(None, ge=1),
     limit: Optional[int] =  Query(20, ge=2, le=100),
@@ -84,7 +84,7 @@ async def get_inventory_transactions(
 
 @router.get("/transactions/holder")
 async def get_inventory_transactions(
-    inventory_id: Optional[str] =  Query(None, description="Inventory Id"),
+    inventory_id: Optional[UUID] =  Query(None, description="Inventory Id"),
     q: str = Query(..., description="Search term"),
     page: Optional[int] = Query(None, ge=1),
     limit: Optional[int] =  Query(20, ge=2, le=100),

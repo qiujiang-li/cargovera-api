@@ -1,0 +1,75 @@
+import boto3
+import logging
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+import uuid
+import requests
+from datetime import datetime
+import os
+
+s3_client = boto3.client(
+    's3',
+    region_name=os.getenv("AWS_REGION"),
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    endpoint_url='http://minio:9000',
+    #config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}),
+)
+
+BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+
+
+
+@retry(
+    stop=stop_after_attempt(3),             # Retry max 3 times
+    wait=wait_fixed(2),                     # Wait 2 seconds between retries
+    retry=retry_if_exception_type(Exception), # Retry on any Exception (customize as needed)
+    reraise=True                           # Raise after final failure
+)
+def download_and_upload_label(label_url: str, order_number: str, sequence: int, carrier: str) -> str:
+    response = requests.get(label_url)
+    response.raise_for_status()
+
+    if "application/pdf" not in response.headers.get("Content-Type", ""):
+        raise ValueError("Downloaded file is not a PDF")
+
+    label_pdf_bytes = response.content
+    # Consistent key per order_id
+    now = datetime.utcnow()
+    s3_key = f"shipping-labels/{carrier}/{now.year}/{now.month:02}/{now.day:02}/{order_number}_{sequence}.pdf"
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=s3_key,
+        Body=label_pdf_bytes,
+        ContentType="application/pdf"
+    )
+    return s3_key
+
+def upload_label_to_s3(label_bytes: bytes, order_id: str, sequence: int, carrier: str = "fedex", extension: str = "pdf") -> str:
+    now = datetime.utcnow()
+    key = f"shipping-labels/{carrier}/{now.year}/{now.month:02}/{now.day:02}/{order_id}_{sequence}.{extension}"
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=key,
+        Body=label_bytes,
+        ContentType="application/pdf"
+    )
+    return key
+
+def upload_file_to_s3(file_data: bytes, filename: str, content_type: str) -> str:
+    now = datetime.utcnow()
+    key = f"shipping-labels/others/{now.year}/{now.month:02}/{now.day:02}/{uuid.uuid4()}_{filename}"
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=key,
+        Body=file_data,
+        ContentType=content_type
+    )
+    return key
+
+def generate_signed_url(s3_key: str, expires_in: int = 3600) -> str:
+    return s3_client.generate_presigned_url(
+        ClientMethod='get_object',
+        Params={'Bucket': BUCKET_NAME, 'Key': s3_key},
+        ExpiresIn=expires_in
+    )
