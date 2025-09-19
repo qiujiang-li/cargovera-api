@@ -1,5 +1,5 @@
 import re
-def parse_name(self, full_name: str) -> tuple[str, str]:
+def parse_name(full_name: str) -> tuple[str, str]:
     """
     Parses a full name string into a first name and last name.
     

@@ -12,6 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from urllib.parse import urlencode
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from app.core.exceptions import ExternalServiceException,ExternalServiceClientError, ExternalServiceServerError
 from app.utils.mist import parse_name, parse_zipcode
 
@@ -177,63 +178,599 @@ class USPSService:
         lowest_rates = self._filter_lowest_rates(rates)
         return lowest_rates
 
-    async def buy_label(self,                  
-                    shipper_address: Dict[str, str],
-                    recipient_address: Dict[str, str],
-                    serviceType: str,
-                    packages: List[Dict[str, Any]],
-                    signature_option: str,
-                    ship_date: Optional[str]
-                    ):
+    async def buy_label(
+        self,
+        shipper_address: Dict[str, str],
+        recipient_address: Dict[str, str],
+        serviceType: str,
+        packages: List[Dict[str, Any]],
+        signature_option: str,
+        ship_date: Optional[str],
+    ) -> Dict[str, Any]:
+        """Purchase a shipping label from USPS."""
 
-        """Purchase a shipping label from USPS"""
+        if not packages:
+            raise ExternalServiceException("USPS requires at least one package to create a label.")
+
         from_first_name, from_last_name = parse_name(shipper_address.contact_name)
-        from_zip_code, from_zip_code_plus = parse_zipcode(shipper_address.zip_code)
+        from_zip_code, from_zip_code_plus = parse_zipcode(shipper_address.postal_code)
         to_first_name, to_last_name = parse_name(recipient_address.contact_name)
-        to_zip_code, to_zip_code_plus = parse_zipcode(recipient_address.zip_code)
+        to_zip_code, to_zip_code_plus = parse_zipcode(recipient_address.postal_code)
+
         extra_services = self.get_usps_signature_code(signature_option, serviceType)
         package = packages[0]
+
         if ship_date is None:
             ship_date = datetime.now().strftime("%Y-%m-%d")
-        request_data = {
-            "toAddress": {
-                "firstName": to_first_name,
-                "lastName": to_last_name,
-                "streetAddress": recipient_address.street_line1,
-                "secondaryAddress": recipient_address.street_line2,
-                "city": recipient_address.city,
-                "state": recipient_address.state,
-                "ZIPCode": to_zip_code,
-                "ZIPPlus4": to_zip_code_plus
-            },
-            "fromAddress": {
-                "firstName": from_first_name,
-                "lastName": from_last_name,
-                "streetAddress": shipper_address.street_line1,
-                "secondaryAddress": shipper_address.street_line2,
-                "city": shipper_address.city,
-                "state": shipper_address.state,
-                "ZIPCode": from_zip_code
-            },
-            "packageDescription": {
-                "mailClass": serviceType,
-                "rateIndicator": "SP",
-                "weightUOM": "lb",
-                "weight": package.get("weight", {}).get("value"),
-                "dimensionsUOM": "in",
-                "length": package.get("dimensions",{}).get("length"),
-                "height": package.get("dimensions",{}).get("height"),
-                "width": package.get("dimensions",{}).get("width"),
-                "processingCategory": "NONSTANDARD",
-                "mailingDate": ship_date,
-                "extraServices": extra_services,
-                "destinationEntryFacilityType": "NONE"
-            }
+
+        from_address_payload = self._build_address_payload(
+            shipper_address,
+            first_name=from_first_name,
+            last_name=from_last_name,
+            zip_code=from_zip_code,
+            zip_plus4=from_zip_code_plus,
+        )
+        to_address_payload = self._build_address_payload(
+            recipient_address,
+            first_name=to_first_name,
+            last_name=to_last_name,
+            zip_code=to_zip_code,
+            zip_plus4=to_zip_code_plus,
+        )
+
+        request_data: Dict[str, Any] = {
+            "accountNumber": self.account_number,
+            "mailClass": serviceType,
+            "mailingDate": ship_date,
+            "rateIndicator": "SP",
+            "priceType": "COMMERCIAL",
+            "extraServices": extra_services,
+            "references": self._collect_usps_references(
+                package,
+                service_type=serviceType,
+                ship_date=ship_date,
+                shipper=shipper_address,
+                recipient=recipient_address,
+            ),
+            "fromAddress": from_address_payload,
+            "toAddress": to_address_payload,
+            "packageDescription": self._build_package_description(package),
         }
 
-        result = await self._make_request("POST", "/prices/v3/base-rates-list/search", request_data)
-        # Process USPS response format
-        logger.debug(f"response from usps rates search {result}")
+        if not request_data["references"]:
+            request_data["references"].append({
+                "name": "SERVICE",
+                "value": serviceType,
+            })
+
+        logger.debug("Submitting USPS label request: %s", request_data)
+        result = await self._make_request("POST", "/labels/v3/label", request_data)
+        logger.debug("USPS label raw response: %s", result)
+
+        errors = self._extract_usps_errors(result)
+        if errors:
+            formatted = "; ".join(self._format_usps_error(err) for err in errors)
+            if any(self._is_server_error(err) for err in errors):
+                logger.error("USPS label creation server error: %s", formatted)
+                raise ExternalServiceServerError(formatted)
+            logger.warning("USPS label creation client error: %s", formatted)
+            raise ExternalServiceClientError(formatted)
+
+        aggregate_charges = self._extract_charges(result)
+        label_payloads = self._extract_label_payloads(result)
+        if not label_payloads and isinstance(result, dict):
+            label_payloads = [result]
+
+        normalized_labels: List[Dict[str, Any]] = []
+        for payload in label_payloads:
+            item_charges = self._merge_charge_details(
+                aggregate_charges,
+                self._extract_charges(payload),
+            )
+            normalized_labels.append(
+                self._build_label_record(payload, item_charges)
+            )
+
+        tracking_numbers = [
+            label.get("trackingNumber")
+            for label in normalized_labels
+            if label.get("trackingNumber")
+        ]
+
+        logger.info(
+            "USPS label created successfully for %s (total=%s)",
+            ", ".join(tracking_numbers) if tracking_numbers else "unknown tracking",
+            aggregate_charges.get("total") or "unknown",
+        )
+
+        response_payload: Dict[str, Any] = {
+            "labels": normalized_labels,
+            "charges": aggregate_charges,
+        }
+
+        if normalized_labels:
+            response_payload["output"] = {
+                "transactionShipments": [
+                    {"pieceResponses": normalized_labels}
+                ]
+            }
+
+        return response_payload
+
+    def _build_address_payload(
+        self,
+        address: Dict[str, Any],
+        *,
+        first_name: str,
+        last_name: str,
+        zip_code: str,
+        zip_plus4: str,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "firstName": first_name,
+            "lastName": last_name,
+            "companyName": getattr(address, "company_name", None),
+            "streetAddress": getattr(address, "street_line1", None),
+            "secondaryAddress": getattr(address, "street_line2", None),
+            "city": getattr(address, "city", None),
+            "state": getattr(address, "state", None),
+            "ZIPCode": zip_code,
+        }
+
+        if zip_plus4:
+            payload["ZIPPlus4"] = zip_plus4
+
+        phone = getattr(address, "phone", None) or self.default_contact_phone
+        if phone:
+            payload["phoneNumber"] = phone
+
+        email = getattr(address, "email", None)
+        if email:
+            payload["email"] = email
+
+        return {k: v for k, v in payload.items() if v not in (None, "")}
+
+    def _build_package_description(self, package: Dict[str, Any]) -> Dict[str, Any]:
+        weight = package.get("weight", {}) if isinstance(package, dict) else {}
+        dimensions = package.get("dimensions", {}) if isinstance(package, dict) else {}
+
+        weight_unit = (weight.get("unit") or weight.get("unitOfMeasure") or "OZ").upper()
+        dimension_unit = (dimensions.get("unit") or dimensions.get("unitOfMeasure") or "IN").upper()
+
+        description: Dict[str, Any] = {
+            "packageId": package.get("packageId")
+            or package.get("id")
+            or "PKG1",
+            "weightUOM": weight_unit,
+            "weight": weight.get("value"),
+            "dimensionsUOM": dimension_unit,
+            "length": dimensions.get("length"),
+            "width": dimensions.get("width"),
+            "height": dimensions.get("height"),
+        }
+
+        girth = package.get("girth")
+        if girth is not None:
+            description["girth"] = girth
+
+        insured = (
+            package.get("insuredValue")
+            or package.get("insured_value")
+            or package.get("declaredValue")
+        )
+        insured_amount = self._parse_charge_amount(insured)
+        if insured_amount is not None:
+            description["insuredValue"] = {
+                "amount": str(insured_amount),
+                "currencyCode": self._infer_currency(insured) or "USD",
+            }
+
+        return {k: v for k, v in description.items() if v not in (None, "")}
+
+    def _collect_usps_references(
+        self,
+        package: Dict[str, Any],
+        *,
+        service_type: str,
+        ship_date: str,
+        shipper: Dict[str, Any],
+        recipient: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        references: List[Dict[str, str]] = []
+
+        def _add_reference(name: Optional[str], value: Optional[Any]) -> None:
+            if not name or value in (None, ""):
+                return
+            references.append({"name": str(name), "value": str(value)})
+
+        package_references = package.get("references")
+        if isinstance(package_references, list):
+            for ref in package_references:
+                if isinstance(ref, dict):
+                    _add_reference(ref.get("name") or ref.get("type"), ref.get("value") or ref.get("number"))
+                else:
+                    _add_reference("REFERENCE", ref)
+        elif isinstance(package_references, dict):
+            _add_reference(
+                package_references.get("name") or package_references.get("type"),
+                package_references.get("value") or package_references.get("number"),
+            )
+
+        for key in ("reference", "customerReference", "customerReferenceNumber"):
+            if package.get(key):
+                _add_reference(key.upper(), package.get(key))
+
+        _add_reference("SERVICE", service_type)
+        _add_reference("SHIP_DATE", ship_date)
+        _add_reference("SHIPPER", getattr(shipper, "company_name", None) or getattr(shipper, "contact_name", None))
+        _add_reference("RECIPIENT", getattr(recipient, "company_name", None) or getattr(recipient, "contact_name", None))
+
+        seen = set()
+        unique_refs: List[Dict[str, str]] = []
+        for ref in references:
+            key = (ref["name"], ref["value"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_refs.append(ref)
+
+        return unique_refs
+
+    def _extract_usps_errors(self, payload: Any) -> List[Dict[str, Any]]:
+        if payload is None:
+            return []
+
+        errors: List[Dict[str, Any]] = []
+
+        def _normalize(value: Any) -> List[Dict[str, Any]]:
+            if value is None:
+                return []
+            if isinstance(value, list):
+                normalized: List[Dict[str, Any]] = []
+                for item in value:
+                    if isinstance(item, dict):
+                        normalized.append(item)
+                    elif isinstance(item, str):
+                        normalized.append({"message": item})
+                return normalized
+            if isinstance(value, dict):
+                return [value]
+            if isinstance(value, str):
+                return [{"message": value}]
+            return []
+
+        if isinstance(payload, dict):
+            for key in ("errors", "error", "errorList", "errorResponse"):
+                if payload.get(key) is not None:
+                    errors.extend(_normalize(payload.get(key)))
+
+            for wrapper_key in ("data", "result", "response"):
+                if wrapper_key in payload:
+                    errors.extend(self._extract_usps_errors(payload[wrapper_key]))
+
+        elif isinstance(payload, list):
+            for item in payload:
+                errors.extend(self._extract_usps_errors(item))
+
+        return errors
+
+    def _format_usps_error(self, error: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        code = error.get("code") or error.get("errorCode") or error.get("error")
+        if code:
+            parts.append(str(code))
+
+        message = error.get("message") or error.get("detail") or error.get("description")
+        if message:
+            parts.append(str(message))
+
+        status = self._error_status_code(error)
+        if status:
+            parts.append(f"status={status}")
+
+        return ": ".join(parts) if parts else str(error)
+
+    def _error_status_code(self, error: Dict[str, Any]) -> Optional[int]:
+        for key in ("status", "statusCode", "httpStatus", "httpStatusCode"):
+            if error.get(key) is not None:
+                try:
+                    return int(error[key])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _is_server_error(self, error: Dict[str, Any]) -> bool:
+        status = self._error_status_code(error)
+        if status is not None:
+            return status >= 500
+
+        code = (error.get("code") or error.get("errorCode") or "").upper()
+        return code.startswith("SVC") or code.startswith("SERVER")
+
+    def _extract_label_payloads(self, payload: Any) -> List[Dict[str, Any]]:
+        if payload is None:
+            return []
+
+        if isinstance(payload, list):
+            result: List[Dict[str, Any]] = []
+            for item in payload:
+                result.extend(self._extract_label_payloads(item))
+            return result
+
+        if not isinstance(payload, dict):
+            return []
+
+        for key in (
+            "labels",
+            "label",
+            "labelDetails",
+            "labelResponses",
+            "labelList",
+            "shippingLabels",
+            "labelData",
+            "labelResponse",
+            "pieces",
+            "pieceResponses",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return [value]
+
+        for wrapper in ("data", "result", "response", "output"):
+            if wrapper in payload:
+                return self._extract_label_payloads(payload[wrapper])
+
+        if any(
+            key in payload
+            for key in ("trackingNumber", "trackingId", "labelUrl", "labelDownload")
+        ):
+            return [payload]
+
+        return []
+
+    def _parse_charge_amount(self, value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+
+        if isinstance(value, Decimal):
+            return value
+
+        if isinstance(value, dict):
+            for key in ("amount", "value", "price", "total", "netCharge"):
+                if value.get(key) is not None:
+                    parsed = self._parse_charge_amount(value[key])
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+
+    def _infer_currency(self, value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in ("currencyCode", "currency", "currencySymbol"):
+                if value.get(key):
+                    return str(value[key])
+        return None
+
+    def _extract_charges(self, payload: Any) -> Dict[str, Any]:
+        charges: Dict[str, Any] = {
+            "currency": "USD",
+            "breakdown": [],
+            "total": None,
+        }
+
+        if not isinstance(payload, dict):
+            return charges
+
+        currency = (
+            self._infer_currency(payload.get("price"))
+            or self._infer_currency(payload.get("postage"))
+            or payload.get("currency")
+        )
+        if currency:
+            charges["currency"] = currency
+
+        base_amount = self._parse_charge_amount(
+            payload.get("postage")
+            or payload.get("price")
+            or payload.get("amount")
+        )
+        if base_amount is not None:
+            charges["breakdown"].append({"type": "POSTAGE", "amount": str(base_amount)})
+
+        for key in ("fees", "extraServices", "surcharges", "additionalFees", "addOnCharges"):
+            extra = payload.get(key)
+            if isinstance(extra, list):
+                for item in extra:
+                    amount = self._parse_charge_amount(item)
+                    if amount is None:
+                        continue
+                    description = (
+                        item.get("description")
+                        or item.get("name")
+                        or item.get("serviceDescription")
+                        or item.get("code")
+                        or key[:-1].upper()
+                    )
+                    charges["breakdown"].append(
+                        {"type": str(description), "amount": str(amount)}
+                    )
+                    if not currency:
+                        inferred = self._infer_currency(item)
+                        if inferred:
+                            currency = inferred
+            elif isinstance(extra, dict):
+                amount = self._parse_charge_amount(extra)
+                if amount is not None:
+                    description = (
+                        extra.get("description")
+                        or extra.get("name")
+                        or key[:-1].upper()
+                    )
+                    charges["breakdown"].append(
+                        {"type": str(description), "amount": str(amount)}
+                    )
+                    if not currency:
+                        inferred = self._infer_currency(extra)
+                        if inferred:
+                            currency = inferred
+
+        total_amount = self._parse_charge_amount(
+            payload.get("totalPrice")
+            or payload.get("totalPostage")
+            or payload.get("total")
+            or payload.get("amountDue")
+        )
+
+        if total_amount is None and charges["breakdown"]:
+            total_value = Decimal("0")
+            for entry in charges["breakdown"]:
+                try:
+                    total_value += Decimal(entry["amount"])
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+            total_amount = total_value
+
+        if total_amount is not None:
+            charges["total"] = str(total_amount)
+
+        if currency:
+            charges["currency"] = currency
+
+        return charges
+
+    def _merge_charge_details(
+        self,
+        aggregate: Dict[str, Any],
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not item["breakdown"] and not item["total"]:
+            return aggregate
+
+        merged_breakdown = item["breakdown"] or aggregate["breakdown"]
+        merged_total = item["total"] or aggregate["total"]
+        merged_currency = item.get("currency") or aggregate.get("currency") or "USD"
+
+        if not merged_total and merged_breakdown:
+            total_value = Decimal("0")
+            for entry in merged_breakdown:
+                try:
+                    total_value += Decimal(entry["amount"])
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+            merged_total = str(total_value)
+
+        return {
+            "currency": merged_currency,
+            "breakdown": merged_breakdown,
+            "total": merged_total,
+        }
+
+    def _extract_label_document(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for key in (
+            "labelDownload",
+            "labelDocument",
+            "labelFile",
+            "document",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        return item
+            elif isinstance(value, dict):
+                return value
+            elif isinstance(value, str):
+                return {"data": value}
+        return None
+
+    def _extract_label_url(
+        self,
+        payload: Dict[str, Any],
+        label_document: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if label_document:
+            for key in ("url", "href", "labelUrl", "downloadUrl"):
+                if label_document.get(key):
+                    return label_document[key]
+
+        for key in ("labelUrl", "labelURL", "url", "downloadUrl", "downloadURL", "href"):
+            if payload.get(key):
+                return payload[key]
+
+        links = payload.get("links")
+        if isinstance(links, list):
+            for link in links:
+                if isinstance(link, dict) and link.get("href"):
+                    return link["href"]
+
+        return None
+
+    def _build_label_record(
+        self,
+        payload: Dict[str, Any],
+        charges: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        record = dict(payload)
+        tracking_number = (
+            record.get("trackingNumber")
+            or record.get("trackingId")
+            or record.get("labelId")
+        )
+        if tracking_number:
+            record["trackingNumber"] = tracking_number
+
+        label_document = self._extract_label_document(record)
+        label_url = self._extract_label_url(record, label_document)
+
+        if label_url:
+            record["labelUrl"] = label_url
+            if not label_document:
+                label_document = {"url": label_url}
+            record["labelDocument"] = label_document
+
+            existing_docs = record.get("packageDocuments")
+            docs: List[Dict[str, Any]]
+            if isinstance(existing_docs, list):
+                docs = [dict(doc) if isinstance(doc, dict) else doc for doc in existing_docs]
+            else:
+                docs = []
+
+            if label_url and not any(
+                isinstance(doc, dict) and doc.get("url") == label_url for doc in docs
+            ):
+                docs.append(
+                    {
+                        "url": label_url,
+                        "documentType": label_document.get("documentType")
+                        or label_document.get("type")
+                        or "LABEL",
+                        "contentType": label_document.get("contentType")
+                        or label_document.get("mimeType")
+                        or "application/pdf",
+                    }
+                )
+
+            record["packageDocuments"] = docs
+
+        if charges.get("total") is not None:
+            record["price"] = charges["total"]
+            record["totalPrice"] = charges["total"]
+        else:
+            price_amount = self._parse_charge_amount(
+                record.get("price") or record.get("postage")
+            )
+            if price_amount is not None:
+                record["price"] = str(price_amount)
+
+        record["charges"] = charges
+
+        return record
     
             
     async def cancel_label(self, tracking_number: str) -> Dict:
