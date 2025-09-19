@@ -1,23 +1,47 @@
+import base64
+import binascii
 import logging
+from datetime import datetime
+from uuid import UUID, uuid4
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from functools import lru_cache
+from typing import Any, List, Optional, Tuple
+
+from fastapi import File, HTTPException, UploadFile
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import (
+    DatabaseException,
+    ExternalServiceException,
+    InsufficientBalanceException,
+    LabelValidationException,
+    NegativeAmountException,
+    RateNotAvailableException,
+    UnSupportedCarrierException,
+)
+from app.db.service import PaginationService
+from app.external.aws_s3 import (
+    download_and_upload_label,
+    generate_signed_url,
+    upload_file_to_s3,
+    upload_label_to_s3,
+)
 from app.external.fedex import FedExService
-from fastapi import HTTPException, UploadFile, File
 from app.external.usps import USPSService
 from app.models.label import CarriersEnum, Label, LabelStatus
-from app.models.transaction import Transaction, TransactionType
-from app.schemas.label import BuyLabelRequest,ShipmentRatesRequest,ShipmentRatesResponse, LabelSchema
-from app.models.user import User
 from app.models.order import Order, OrderStatus
-from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.transaction import Transaction, TransactionType
+from app.models.user import User
+from app.schemas.label import (
+    BuyLabelRequest,
+    CancelLabelRequest,
+    LabelSchema,
+    ShipmentRatesRequest,
+    ShipmentRatesResponse,
+)
 from app.schemas.pagination import SortOrder
-from typing import List, Optional
-from sqlalchemy import select
-from functools import lru_cache
-from app.core.exceptions import LabelValidationException, RateNotAvailableException, InsufficientBalanceException, DatabaseException, NegativeAmountException
-from uuid import uuid4, UUID
-from decimal import Decimal, ROUND_HALF_UP
 from app.utils.money import Money
-from app.db.service import PaginationService
-from app.external.aws_s3 import generate_signed_url, download_and_upload_label, upload_file_to_s3
 import asyncio
 
 
@@ -62,17 +86,31 @@ class LabelService:
         results = sorted(rates, key=lambda x: x.total_charge)
         return results
 
-    async def buy_label(self, carrier: CarriersEnum, data: BuyLabelRequest, user: User, db: AsyncSession):
+    async def buy_label(
+        self,
+        carrier: CarriersEnum,
+        data: BuyLabelRequest,
+        user: User,
+        db: AsyncSession,
+    ):
         if carrier == CarriersEnum.fedex:
             return await self._buy_fedex_label(data, user, db)
-        else:
-            raise UnSupportedCarrierException(carrier)
+        if carrier == CarriersEnum.usps:
+            return await self._buy_usps_label(data, user, db)
+        raise UnSupportedCarrierException(carrier)
 
-    async def cancel_label(self, carrier: CarriersEnum, data: BuyLabelRequest, user: User, db: AsyncSession):
+    async def cancel_label(
+        self,
+        carrier: CarriersEnum,
+        data: CancelLabelRequest,
+        user: User,
+        db: AsyncSession,
+    ):
         if carrier == CarriersEnum.fedex:
             return await self._cancel_fedex_label(data, user, db)
-        else:
-            raise UnSupportedCarrierException(carrier)
+        if carrier == CarriersEnum.usps:
+            return await self._cancel_usps_label(data, user, db)
+        raise UnSupportedCarrierException(carrier)
 
     
     async def validate_shipment(self, carrier: CarriersEnum, data: BuyLabelRequest):
@@ -129,7 +167,9 @@ class LabelService:
             raise DatabaseException(500, f"Unexpected error while getting labels")
     
     
-    async def _cancel_fedex_label(self, data: BuyLabelRequest, user: User, db: AsyncSession):
+    async def _cancel_fedex_label(
+        self, data: CancelLabelRequest, user: User, db: AsyncSession
+    ):
         fedex = get_fedex_service()
         success = await fedex.cancel_label(tracking_number=data.tracking_number)
         if not success:
@@ -198,9 +238,9 @@ class LabelService:
     
     async def _buy_fedex_label(self, data: BuyLabelRequest, user: User, db: AsyncSession):
         fedex = get_fedex_service()
-        
+
         fedex_signature_option = fedex.get_signature_option(data.signature_option)
-        
+
         packages = data.packages
         updated_packages = [
             {**pkg, "packageSpecialServices": {"signatureOptionType": fedex_signature_option}}
@@ -311,10 +351,396 @@ class LabelService:
             logger.exception(f"failed to commit changes of buy label to db")
             raise DatabaseException(500, "failed to commit changes of buy label to db")
 
+    async def _buy_usps_label(
+        self, data: BuyLabelRequest, user: User, db: AsyncSession
+    ) -> List[Label]:
+        usps = get_usps_service()
+
+        rates = await usps.get_rates(
+            pickup_postal_code=data.shipper.postal_code,
+            destination_postal_code=data.recipient.postal_code,
+            packages=data.packages,
+        )
+
+        matching_rate = next(
+            (rate for rate in rates if rate.get("mailClass") == data.service_type),
+            None,
+        )
+        if not matching_rate:
+            raise RateNotAvailableException(data.service_type)
+
+        base_price = self._to_decimal(matching_rate.get("price"))
+        if base_price is None:
+            raise ExternalServiceException(
+                "Unable to determine USPS rate for requested service type."
+            )
+
+        estimated_price = self._apply_multiplier_to_rates(base_price, user.multiplier)
+        if user.balance < estimated_price:
+            raise InsufficientBalanceException(user.balance, base_price)
+
+        purchase_response = await usps.buy_label(
+            shipper_address=data.shipper,
+            recipient_address=data.recipient,
+            serviceType=data.service_type,
+            packages=data.packages,
+            signature_option=data.signature_option,
+            ship_date=data.ship_date,
+        )
+
+        label_payloads = self._normalize_usps_label_response(purchase_response)
+        if not label_payloads:
+            raise ExternalServiceException("USPS did not return label details.")
+
+        labels: List[Label] = []
+        for idx, payload in enumerate(label_payloads, start=1):
+            tracking_number = (
+                payload.get("trackingNumber")
+                or payload.get("tracking_number")
+                or payload.get("trackingId")
+            )
+            if not tracking_number:
+                raise ExternalServiceException(
+                    "USPS label response missing tracking number."
+                )
+
+            label_base_price = self._to_decimal(
+                payload.get("price")
+                or payload.get("amount")
+                or payload.get("totalPrice")
+                or base_price
+            )
+            if label_base_price is None:
+                label_base_price = base_price
+
+            cost_estimate = self._apply_multiplier_to_rates(
+                label_base_price, user.multiplier
+            )
+
+            order_reference = str(data.order_number or tracking_number)
+            label_url = self._extract_usps_label_url(payload)
+            if label_url:
+                s3_key = download_and_upload_label(
+                    label_url, order_reference, idx, CarriersEnum.usps.value
+                )
+            else:
+                label_bytes, extension = self._extract_usps_label_bytes(payload)
+                if label_bytes is None:
+                    raise ExternalServiceException(
+                        "USPS label response missing printable document."
+                    )
+                s3_key = upload_label_to_s3(
+                    label_bytes,
+                    order_reference,
+                    idx,
+                    carrier=CarriersEnum.usps.value,
+                    extension=extension,
+                )
+
+            label = Label(
+                id=str(uuid4()),
+                user_id=user.id,
+                order_number=data.order_number,
+                tracking_number=tracking_number,
+                label_url=s3_key,
+                status=LabelStatus.new,
+                carrier=CarriersEnum.usps,
+                service_type=data.service_type,
+                cost_estimate=cost_estimate,
+            )
+            if label_base_price is not None:
+                label.cost_actual = label_base_price
+            labels.append(label)
+
+        try:
+            result = await db.execute(
+                select(User).where(User.id == user.id).with_for_update()
+            )
+            user_locked = result.scalar_one()
+
+            result = await db.execute(
+                select(Order).where(Order.order_number == data.order_number)
+            )
+            order = result.scalars().first()
+            if order:
+                order.status = OrderStatus.shipped
+
+            transactions: List[Transaction] = []
+            for label in labels:
+                user_locked.balance -= label.cost_estimate
+                transaction = Transaction(
+                    id=str(uuid4()),
+                    user_id=user_locked.id,
+                    amount=label.cost_estimate,
+                    new_balance=user_locked.balance,
+                    trans_type=TransactionType.usage,
+                    note=(
+                        f"Label purchase for tracking {label.tracking_number} - "
+                        f"{label.service_type}"
+                    ),
+                )
+                transactions.append(transaction)
+
+            db.add_all(labels)
+            db.add_all(transactions)
+            await db.commit()
+            return labels
+        except Exception:
+            await db.rollback()
+            logger.exception("failed to commit USPS label purchase to db")
+            raise DatabaseException(500, "failed to commit changes of buy label to db")
+
+    async def _cancel_usps_label(
+        self, data: CancelLabelRequest, user: User, db: AsyncSession
+    ):
+        usps = get_usps_service()
+        await usps.cancel_label(tracking_number=data.tracking_number)
+
+        try:
+            result = await db.execute(
+                select(Label)
+                .where(Label.tracking_number == data.tracking_number)
+                .with_for_update()
+            )
+            label = result.scalar_one_or_none()
+            if not label:
+                raise DatabaseException(404, "Label not found")
+
+            if label.status == LabelStatus.cancelled:
+                raise DatabaseException(400, "Label already cancelled")
+
+            result = await db.execute(
+                select(User).where(User.id == user.id).with_for_update()
+            )
+            user_locked = result.scalar_one()
+
+            label.status = LabelStatus.cancelled
+
+            refund_amount = label.cost_estimate
+
+            user_locked.balance += refund_amount
+
+            transaction = Transaction(
+                id=str(uuid4()),
+                user_id=user_locked.id,
+                amount=refund_amount,
+                new_balance=user_locked.balance,
+                trans_type=TransactionType.refund,
+                note=(
+                    f"Refund label purchase for tracking {label.tracking_number} - "
+                    f"{label.service_type}"
+                ),
+            )
+
+            db.add(transaction)
+            await db.commit()
+        except DatabaseException:
+            raise
+        except Exception:
+            await db.rollback()
+            logger.exception("Failed to commit USPS label cancel to DB")
+            raise DatabaseException(500, "Failed to commit label cancel to DB")
+
+    def _normalize_usps_label_response(self, response: Any) -> List[dict]:
+        if response is None:
+            return []
+
+        if isinstance(response, dict):
+            for key in (
+                "labels",
+                "label",
+                "labelDetails",
+                "labelResponses",
+                "labelList",
+                "shippingLabels",
+            ):
+                value = response.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+                if isinstance(value, dict):
+                    return [value]
+
+            for wrapper_key in ("data", "result", "response"):
+                if wrapper_key in response:
+                    nested = self._normalize_usps_label_response(
+                        response[wrapper_key]
+                    )
+                    if nested:
+                        return nested
+
+            return [response]
+
+        if isinstance(response, list):
+            return [item for item in response if isinstance(item, dict)]
+
+        return []
+
+    def _extract_usps_label_url(self, payload: dict) -> Optional[str]:
+        possible_keys = [
+            "labelUrl",
+            "labelURL",
+            "label_url",
+            "url",
+            "downloadUrl",
+            "downloadURL",
+            "href",
+        ]
+
+        for key in possible_keys:
+            value = payload.get(key)
+            if value:
+                return value
+
+        nested_sections = [
+            "labelDownload",
+            "labelDocument",
+            "labelFile",
+            "document",
+        ]
+
+        for nested_key in nested_sections:
+            nested_value = payload.get(nested_key)
+            if isinstance(nested_value, dict):
+                for key in possible_keys:
+                    inner = nested_value.get(key)
+                    if inner:
+                        return inner
+            elif isinstance(nested_value, list):
+                for item in nested_value:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in possible_keys:
+                        inner = item.get(key)
+                        if inner:
+                            return inner
+
+        links = payload.get("links")
+        if isinstance(links, list):
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                if link.get("href"):
+                    return link["href"]
+
+        return None
+
+    def _extract_usps_label_bytes(self, payload: dict) -> Tuple[Optional[bytes], str]:
+        candidates = [
+            payload.get("labelData"),
+            payload.get("label"),
+            payload.get("labelBytes"),
+            payload.get("labelFile"),
+            payload.get("labelDocument"),
+            payload.get("document"),
+        ]
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            if isinstance(candidate, list):
+                for item in candidate:
+                    decoded = self._decode_usps_label_candidate(item)
+                    if decoded:
+                        return decoded
+                continue
+
+            decoded = self._decode_usps_label_candidate(candidate)
+            if decoded:
+                return decoded
+
+        return None, "pdf"
+
+    def _decode_usps_label_candidate(
+        self, candidate: Any
+    ) -> Optional[Tuple[bytes, str]]:
+        if not candidate:
+            return None
+
+        content_type: Optional[str] = None
+        data = candidate
+
+        if isinstance(candidate, dict):
+            content_type = (
+                candidate.get("contentType")
+                or candidate.get("mimeType")
+                or candidate.get("type")
+                or candidate.get("format")
+            )
+
+            for key in ("data", "content", "value", "file", "bytes", "label"):
+                if candidate.get(key) is not None:
+                    data = candidate[key]
+                    break
+
+            if isinstance(data, dict):
+                nested = self._decode_usps_label_candidate(data)
+                if nested:
+                    bytes_data, extension = nested
+                    if content_type:
+                        extension = self._extension_from_content_type(content_type)
+                    return bytes_data, extension
+
+        if isinstance(data, bytes):
+            return data, self._extension_from_content_type(content_type)
+
+        if isinstance(data, str):
+            encoded = data
+            if data.startswith("data:"):
+                header, encoded = data.split(",", 1)
+                if not content_type:
+                    content_type = header.split(";", 1)[0].split(":", 1)[1]
+
+            try:
+                decoded_bytes = base64.b64decode(encoded)
+            except (binascii.Error, ValueError):
+                return None
+
+            return decoded_bytes, self._extension_from_content_type(content_type)
+
+        return None
+
+    def _extension_from_content_type(self, content_type: Optional[str]) -> str:
+        if not content_type:
+            return "pdf"
+
+        lowered = content_type.lower()
+        if "png" in lowered:
+            return "png"
+        if "zpl" in lowered:
+            return "zpl"
+        if "jpeg" in lowered or "jpg" in lowered:
+            return "jpg"
+        if "gif" in lowered:
+            return "gif"
+        return "pdf"
+
+    def _to_decimal(self, value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+
+        if isinstance(value, Decimal):
+            return value
+
+        if isinstance(value, Money):
+            return value.to_decimal()
+
+        if isinstance(value, dict):
+            for key in ("amount", "value", "price"):
+                if value.get(key) is not None:
+                    return self._to_decimal(value[key])
+            return None
+
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            logger.debug("Unable to convert value to Decimal: %s", value)
+            return None
+
     async def _validate_fedex_shipment(self, data:BuyLabelRequest):
         fedex_service = get_fedex_service()
-        return await fedex_service.validate_shipment(shipper_address=data.shipper, 
-                                            recipient_address=data.recipient, 
+        return await fedex_service.validate_shipment(shipper_address=data.shipper,
+                                            recipient_address=data.recipient,
                                             serviceType=data.service_type, 
                                             total_weight=data.total_weight, 
                                             packages=data.packages, 

@@ -36,6 +36,17 @@ async def buy_label(data: BuyLabelRequest, db: AsyncSession = Depends(get_db), u
     label_responses = [LabelSchema.from_orm(label) for label in labels]
     return {"data": label_responses}
 
+@router.post("/usps/buy-label")
+async def buy_usps_label(
+    data: BuyLabelRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    label_service: LabelService = Depends(get_label_service),
+):
+    labels = await label_service.buy_label(CarriersEnum.usps, data, user, db)
+    label_responses = [LabelSchema.from_orm(label) for label in labels]
+    return {"data": label_responses}
+
 @router.post("/fedex/validate")
 async def validate_shipment(data: BuyLabelRequest, label_service: LabelService = Depends(get_label_service)):
     return await label_service.validate_shipment(CarriersEnum.fedex, data)
@@ -44,6 +55,15 @@ async def validate_shipment(data: BuyLabelRequest, label_service: LabelService =
 @router.post("/fedex/cancel-label", status_code=status.HTTP_204_NO_CONTENT)
 async def cancel_label(data: CancelLabelRequest, db: AsyncSession = Depends(get_db), user=Depends(get_current_user), label_service: LabelService = Depends(get_label_service)):
     return await label_service.cancel_label(CarriersEnum.fedex, data, user, db)
+
+@router.post("/usps/cancel-label", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_usps_label(
+    data: CancelLabelRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    label_service: LabelService = Depends(get_label_service),
+):
+    return await label_service.cancel_label(CarriersEnum.usps, data, user, db)
 
 @router.get("")
 async def get_labels(
