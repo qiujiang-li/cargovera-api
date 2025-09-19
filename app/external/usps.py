@@ -67,24 +67,32 @@ class USPSService:
             return data["access_token"]
     
 
-    def get_usps_signature_code(option: str, mailClass: str = "USPS_GROUND_ADVANTAGE") -> int:
+    def get_usps_signature_code(self, option: str, mailClass: str = "USPS_GROUND_ADVANTAGE") -> List[int]:
         """
-        Returns the USPS extra service code for a given signature option and shipping method.
+        Returns the USPS extra service codes for a given signature option and shipping method.
 
         Args:
             option (str): Custom signature option (e.g., 'direct', 'none', 'adult')
-            shipping_method (str): Shipping method (e.g., 'USPS_GROUND_ADVANTAGE', 'express')
+            mailClass (str): Shipping method (e.g., 'USPS_GROUND_ADVANTAGE', 'PRIORITY_MAIL')
 
         Returns:
-            int: USPS extra service code
+            List[int]: USPS extra service code list for the requested option.
 
         Raises:
             ValueError: If option or shipping method is invalid
         """
         try:
-            return _signature_options_map[mailClass][option]
+            codes = self._signature_options_map[mailClass][option]
         except KeyError:
             raise ValueError(f"Invalid combination: shipping_method='{mailClass}', option='{option}'")
+
+        logger.debug(
+            "Resolved USPS signature option '%s' for %s to extra services %s",
+            option,
+            mailClass,
+            codes,
+        )
+        return codes
 
     
 
@@ -183,7 +191,7 @@ class USPSService:
         from_zip_code, from_zip_code_plus = parse_zipcode(shipper_address.zip_code)
         to_first_name, to_last_name = parse_name(recipient_address.contact_name)
         to_zip_code, to_zip_code_plus = parse_zipcode(recipient_address.zip_code)
-        extra_services = get_usps_signature_code(signature_option, serviceType)
+        extra_services = self.get_usps_signature_code(signature_option, serviceType)
         package = packages[0]
         if ship_date is None:
             ship_date = datetime.now().strftime("%Y-%m-%d")
