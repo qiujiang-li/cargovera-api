@@ -122,15 +122,52 @@ class USPSService:
                 else:
                     raise ValueError(f"Unsupported HTTP method: {method}")
 
-                logger.debug(f"USPS response ({method}) from {url}: {response.text}")
+                logger.debug(
+                    "USPS response (%s) from %s: status=%s body=%s",
+                    method,
+                    url,
+                    response.status_code,
+                    response.text,
+                )
 
-                result = response.json()
-                if response.status_code == 200:
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = {}
+
+                if 200 <= response.status_code < 300:
                     return result
-                elif 400 <= response.status_code < 500:
-                    raise ExternalServiceClientError(f"Client error: {response.text}")
-                else:
-                    raise ExternalServiceServerError(f"Server error: {response.text}")
+
+                errors = self._extract_usps_errors(result)
+                message = ""
+                if errors:
+                    message = "; ".join(
+                        self._format_usps_error(error) for error in errors
+                    )
+                elif isinstance(result, dict):
+                    message = (
+                        result.get("message")
+                        or result.get("detail")
+                        or result.get("description")
+                        or result.get("error")
+                        or result.get("title")
+                        or ""
+                    )
+
+                if 400 <= response.status_code < 500:
+                    logger.warning(
+                        "USPS client error (%s %s): %s", method, endpoint, message or response.text
+                    )
+                    raise ExternalServiceClientError(
+                        message or f"Client error: {response.text}"
+                    )
+
+                logger.error(
+                    "USPS server error (%s %s): %s", method, endpoint, message or response.text
+                )
+                raise ExternalServiceServerError(
+                    message or f"Server error: {response.text}"
+                )
         except httpx.RequestError as e:
             logger.exception(f"Request error for {method} {endpoint}")
             raise ExternalServiceException(f"Request failed: {str(e)}")
