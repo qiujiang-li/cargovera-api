@@ -172,8 +172,94 @@ async def test_buy_label_success(monkeypatch, caplog, shipper_address, recipient
     assert label["charges"]["total"] == "11.05"
     assert label["price"] == "11.05"
     assert label["packageDocuments"][0]["url"] == "https://example.com/label.pdf"
+    assert label["charges"]["breakdown"] == [
+        {"type": "POSTAGE", "amount": "8.95"},
+        {"type": "Signature Confirmation", "amount": "2.10"},
+    ]
+
+    assert result["charges"]["total"] == "11.05"
+    assert result["charges"]["currency"] == "USD"
+    assert result["output"]["transactionShipments"][0]["pieceResponses"] == labels
 
     assert any("USPS label created successfully" in record.message for record in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_buy_label_multiple_labels(monkeypatch, shipper_address, recipient_address, usps_packages):
+    service = USPSService()
+
+    sample_response = {
+        "totalPrice": {"amount": "23.75", "currencyCode": "USD"},
+        "fees": [
+            {
+                "description": "Insurance",
+                "amount": {"value": "2.00", "currencyCode": "USD"},
+            }
+        ],
+        "labels": [
+            {
+                "labelId": "LBL111111",
+                "trackingNumber": "9400100000000000000001",
+                "postage": {"amount": "10.00", "currencyCode": "USD"},
+                "fees": [
+                    {
+                        "description": "Signature Confirmation",
+                        "amount": {"value": "1.25", "currencyCode": "USD"},
+                    }
+                ],
+                "labelDownload": {"url": "https://example.com/label1.pdf"},
+            },
+            {
+                "labelId": "LBL222222",
+                "trackingNumber": "9400100000000000000002",
+                "postage": {"amount": "10.50", "currencyCode": "USD"},
+                "labelDocument": {
+                    "url": "https://example.com/label2.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        ],
+    }
+
+    async def fake_make_request(method: str, endpoint: str, data: dict | None = None):
+        return sample_response
+
+    monkeypatch.setattr(service, "_make_request", fake_make_request)
+
+    result = await service.buy_label(
+        shipper_address=shipper_address,
+        recipient_address=recipient_address,
+        serviceType="PRIORITY_MAIL",
+        packages=usps_packages,
+        signature_option="direct",
+        ship_date="2024-09-20",
+    )
+
+    assert result["charges"]["total"] == "23.75"
+    assert result["charges"]["breakdown"] == [
+        {"type": "Insurance", "amount": "2.00"},
+    ]
+
+    labels = result["labels"]
+    assert len(labels) == 2
+    first, second = labels
+
+    assert first["trackingNumber"] == "9400100000000000000001"
+    assert first["labelUrl"] == "https://example.com/label1.pdf"
+    assert first["charges"]["total"] == "11.25"
+    assert first["charges"]["breakdown"] == [
+        {"type": "POSTAGE", "amount": "10.00"},
+        {"type": "Signature Confirmation", "amount": "1.25"},
+    ]
+
+    assert second["trackingNumber"] == "9400100000000000000002"
+    assert second["labelUrl"] == "https://example.com/label2.pdf"
+    assert second["charges"]["total"] == "10.50"
+    assert second["charges"]["breakdown"] == [
+        {"type": "POSTAGE", "amount": "10.50"},
+    ]
+
+    assert result["output"]["transactionShipments"][0]["pieceResponses"] == labels
 
 
 @pytest.mark.anyio
