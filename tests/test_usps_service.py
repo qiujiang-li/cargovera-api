@@ -163,6 +163,13 @@ async def test_buy_label_success(monkeypatch, caplog, shipper_address, recipient
     assert {"name": "ORDER", "value": "ORDER-123"} in payload["references"]
     assert any(ref["name"] == "SERVICE" for ref in payload["references"])
 
+    from_address = payload["fromAddress"]
+    to_address = payload["toAddress"]
+    assert from_address["ZIPCode"] == "73301"
+    assert "ZIPPlus4" not in from_address
+    assert to_address["ZIPCode"] == "75201"
+    assert "ZIPPlus4" not in to_address
+
     labels = result["labels"]
     assert isinstance(labels, list)
     assert len(labels) == 1
@@ -182,6 +189,72 @@ async def test_buy_label_success(monkeypatch, caplog, shipper_address, recipient
     assert result["output"]["transactionShipments"][0]["pieceResponses"] == labels
 
     assert any("USPS label created successfully" in record.message for record in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_buy_label_parses_zip_plus4(monkeypatch, shipper_address, recipient_address, usps_packages):
+    service = USPSService()
+
+    sample_response = {
+        "labelId": "LBL987654",
+        "trackingNumber": "9400199999999999999999",
+        "labelDownload": {
+            "url": "https://example.com/label2.pdf",
+            "contentType": "application/pdf",
+        },
+        "postage": {"amount": "12.95", "currencyCode": "USD"},
+    }
+
+    recorded: dict[str, object] = {}
+
+    async def fake_make_request(method: str, endpoint: str, data: dict | None = None):
+        recorded["method"] = method
+        recorded["endpoint"] = endpoint
+        recorded["data"] = data
+        return sample_response
+
+    monkeypatch.setattr(service, "_make_request", fake_make_request)
+
+    shipper_plus4 = shipper_address.model_copy(
+        update={
+            "postal_code": "73301-1234",
+            "street_line2": None,
+            "company_name": None,
+            "phone": None,
+            "email": None,
+        }
+    ).model_dump()
+    recipient_plus4 = recipient_address.model_copy(
+        update={"postal_code": "75201-5678", "street_line2": None}
+    )
+
+    result = await service.buy_label(
+        shipper_address=shipper_plus4,
+        recipient_address=recipient_plus4,
+        serviceType="PRIORITY_MAIL",
+        packages=usps_packages,
+        signature_option="none",
+        ship_date="2024-09-19",
+    )
+
+    payload = recorded["data"]
+    assert isinstance(payload, dict)
+
+    from_address = payload["fromAddress"]
+    assert from_address["ZIPCode"] == "73301"
+    assert from_address["ZIPPlus4"] == "1234"
+    assert from_address["streetAddress"] == "123 Sender St"
+    assert "secondaryAddress" not in from_address
+    assert "companyName" not in from_address
+    assert from_address["phoneNumber"] == os.environ["DEFAULT_CONTACT_PHONE"]
+    assert "email" not in from_address
+
+    to_address = payload["toAddress"]
+    assert to_address["ZIPCode"] == "75201"
+    assert to_address["ZIPPlus4"] == "5678"
+    assert "secondaryAddress" not in to_address
+
+    assert result["labels"][0]["trackingNumber"] == "9400199999999999999999"
 
 
 @pytest.mark.anyio

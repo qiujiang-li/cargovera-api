@@ -10,7 +10,7 @@ import httpx
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from urllib.parse import urlencode
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from app.core.exceptions import ExternalServiceException,ExternalServiceClientError, ExternalServiceServerError
@@ -217,8 +217,8 @@ class USPSService:
 
     async def buy_label(
         self,
-        shipper_address: Dict[str, str],
-        recipient_address: Dict[str, str],
+        shipper_address: Any,
+        recipient_address: Any,
         serviceType: str,
         packages: List[Dict[str, Any]],
         signature_option: str,
@@ -229,10 +229,34 @@ class USPSService:
         if not packages:
             raise ExternalServiceException("USPS requires at least one package to create a label.")
 
-        from_first_name, from_last_name = parse_name(shipper_address.contact_name)
-        from_zip_code, from_zip_code_plus = parse_zipcode(shipper_address.postal_code)
-        to_first_name, to_last_name = parse_name(recipient_address.contact_name)
-        to_zip_code, to_zip_code_plus = parse_zipcode(recipient_address.postal_code)
+        shipper_contact = self._get_address_field(shipper_address, "contact_name", "") or ""
+        recipient_contact = self._get_address_field(recipient_address, "contact_name", "") or ""
+
+        from_first_name, from_last_name = parse_name(shipper_contact)
+        to_first_name, to_last_name = parse_name(recipient_contact)
+
+        shipper_postal_code = self._get_address_field(
+            shipper_address, "postal_code", "", aliases=("zip_code",)
+        ) or ""
+        recipient_postal_code = self._get_address_field(
+            recipient_address, "postal_code", "", aliases=("zip_code",)
+        ) or ""
+
+        from_zip_code, from_zip_code_plus = parse_zipcode(str(shipper_postal_code))
+        to_zip_code, to_zip_code_plus = parse_zipcode(str(recipient_postal_code))
+
+        logger.debug(
+            "Parsed shipper postal code '%s' into ZIP='%s' plus4='%s'",
+            shipper_postal_code,
+            from_zip_code,
+            from_zip_code_plus,
+        )
+        logger.debug(
+            "Parsed recipient postal code '%s' into ZIP='%s' plus4='%s'",
+            recipient_postal_code,
+            to_zip_code,
+            to_zip_code_plus,
+        )
 
         extra_services = self.get_usps_signature_code(signature_option, serviceType)
         package = packages[0]
@@ -334,9 +358,39 @@ class USPSService:
 
         return response_payload
 
+    def _get_address_field(
+        self,
+        address: Any,
+        field: str,
+        default: Any = None,
+        *,
+        aliases: Tuple[str, ...] = (),
+    ) -> Any:
+        """Safely retrieve an address attribute whether the input is an object or dict."""
+
+        if address is None:
+            return default
+
+        candidate_fields = (field, *aliases)
+
+        for candidate in candidate_fields:
+            value: Any
+            if isinstance(address, dict):
+                value = address.get(candidate, None)
+            else:
+                value = getattr(address, candidate, None)
+
+            if value is not None:
+                return value
+
+        if isinstance(address, dict):
+            return address.get(field, default)
+
+        return getattr(address, field, default)
+
     def _build_address_payload(
         self,
-        address: Dict[str, Any],
+        address: Any,
         *,
         first_name: str,
         last_name: str,
@@ -346,22 +400,22 @@ class USPSService:
         payload: Dict[str, Any] = {
             "firstName": first_name,
             "lastName": last_name,
-            "companyName": getattr(address, "company_name", None),
-            "streetAddress": getattr(address, "street_line1", None),
-            "secondaryAddress": getattr(address, "street_line2", None),
-            "city": getattr(address, "city", None),
-            "state": getattr(address, "state", None),
+            "companyName": self._get_address_field(address, "company_name"),
+            "streetAddress": self._get_address_field(address, "street_line1"),
+            "secondaryAddress": self._get_address_field(address, "street_line2"),
+            "city": self._get_address_field(address, "city"),
+            "state": self._get_address_field(address, "state"),
             "ZIPCode": zip_code,
         }
 
         if zip_plus4:
             payload["ZIPPlus4"] = zip_plus4
 
-        phone = getattr(address, "phone", None) or self.default_contact_phone
+        phone = self._get_address_field(address, "phone") or self.default_contact_phone
         if phone:
             payload["phoneNumber"] = phone
 
-        email = getattr(address, "email", None)
+        email = self._get_address_field(address, "email")
         if email:
             payload["email"] = email
 
@@ -439,8 +493,15 @@ class USPSService:
 
         _add_reference("SERVICE", service_type)
         _add_reference("SHIP_DATE", ship_date)
-        _add_reference("SHIPPER", getattr(shipper, "company_name", None) or getattr(shipper, "contact_name", None))
-        _add_reference("RECIPIENT", getattr(recipient, "company_name", None) or getattr(recipient, "contact_name", None))
+        shipper_name = self._get_address_field(shipper, "company_name") or self._get_address_field(
+            shipper, "contact_name"
+        )
+        recipient_name = self._get_address_field(recipient, "company_name") or self._get_address_field(
+            recipient, "contact_name"
+        )
+
+        _add_reference("SHIPPER", shipper_name)
+        _add_reference("RECIPIENT", recipient_name)
 
         seen = set()
         unique_refs: List[Dict[str, str]] = []
